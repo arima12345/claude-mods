@@ -1,0 +1,10 @@
+{
+  "name": "ja-reply",
+  "version": "0.1.0",
+  "description": "Claude の報告がほとんど英語だったら、同じターンの中で日本語に書き直させる",
+  "author": { "name": "arima12345" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "mode": { "type": "string", "title": "英語の返事への対応", "description": "rewrite: 日本語で書き直させる / notify: 知らせるだけ", "default": "rewrite", "options": ["rewrite", "notify"] }
+  }
+}

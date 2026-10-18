@@ -8,6 +8,7 @@
 | [goal2](plugins/goal2) | `/goal` の改良版。本当に達成したときだけ終わり、エラーで止まっても自動で再開する |
 | [edit-check](plugins/edit-check) | ファイルを変更したら、作業を終える前にそのプロジェクトの型チェックや lint を自動で実行する |
 | [compact-memo](plugins/compact-memo) | 会話の圧縮の直前に、ゴール・やることの残り・変更中のファイル・未解決の問題をメモに残し、圧縮後に Claude へ渡し直す |
+| [ja-reply](plugins/ja-reply) | Claude の報告がほとんど英語だったら、同じターンの中で日本語に書き直させる |
 
 ## インストール
 
