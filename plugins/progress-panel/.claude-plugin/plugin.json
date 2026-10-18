@@ -1,1 +1,1 @@
-{ "name": "progress-panel", "version": "0.2.0", "description": "Claudeの進捗（作業中か、今何をしているか、タスクの進み具合）と、利用枠・コンテキストの残りをひと目で見せるパネル", "types": "./types/index.d.ts" }
+{ "name": "progress-panel", "version": "0.3.0", "description": "Claudeの進捗（作業中か、今何をしているか、タスクの進み具合）、利用枠・コンテキストの残り、サブエージェントと作業ログをひと目で見せるパネル", "types": "./types/index.d.ts" }
