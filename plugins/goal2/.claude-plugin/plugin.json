@@ -1,0 +1,12 @@
+{
+  "name": "goal2",
+  "version": "0.1.0",
+  "description": "/goal の改良版。本当に達成したときだけ終わり、止まっても自動で再開する",
+  "author": { "name": "arima12345" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "judgeModel": { "type": "string", "title": "軽い判定のモデル", "description": "止まるたびに達成したかを判定するモデル", "default": "haiku", "options": ["haiku", "sonnet", "opus"] },
+    "verifierModel": { "type": "string", "title": "確認役のモデル", "description": "「達成」と判定されたときに実物を確かめるサブエージェントのモデル", "default": "sonnet", "options": ["haiku", "sonnet", "opus"] },
+    "maxChecks": { "type": "number", "title": "判定の上限回数", "description": "これを超えたら止めて報告する", "default": 30 }
+  }
+}
