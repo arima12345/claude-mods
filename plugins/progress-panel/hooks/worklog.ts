@@ -95,6 +95,23 @@ export function addEntry(log: LogEntry[], entry: LogEntry): LogEntry[] {
 
 export const basename = (path: string) => path.split(/[\\/]/).filter(Boolean).at(-1) ?? path
 
+// Whether the turn that began at `since` reached a break in the work:
+// the task list all done, a commit, or a test or check passing that had failed.
+export function isBreak(log: LogEntry[], since: number, tasks: { status: string }[]): boolean {
+  if (tasks.length > 0 && tasks.every(t => t.status === 'completed')) return true
+  const failed = new Set<string>()
+  for (const e of log) {
+    if (e.t >= since && e.kind === 'commit') return true
+    if (e.kind !== 'test' && e.kind !== 'check') continue
+    if (e.outcome === 'fail') failed.add(e.command)
+    if (e.outcome !== 'pass') continue
+    if (e.t >= since && failed.has(e.command)) return true
+    failed.delete(e.command)
+  }
+
+  return false
+}
+
 const OUTCOME_MARK: Record<Outcome, string> = { pass: '✓', fail: '✗', interrupted: '中断', background: '…' }
 const OUTCOME_WORD: Record<Outcome, string> = { pass: '成功', fail: '失敗', interrupted: '中断', background: 'バックグラウンド' }
 const KIND_WORD = { test: 'テスト', check: 'チェック' } as const

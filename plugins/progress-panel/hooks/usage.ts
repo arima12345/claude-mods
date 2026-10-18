@@ -233,7 +233,7 @@ export function tokens(n: number): string {
   return n >= 1_000_000 ? `${Math.round(n / 100_000) / 10}M` : `${Math.round(n / 1000)}k`
 }
 
-export function contextLines(context: ContextFill, history: number[]): string[] {
+export function contextLines(context: ContextFill, history: number[], valve = 0): string[] {
   const pct = context.percent
   if (pct === undefined) return []
   const lines: string[] = []
@@ -245,8 +245,47 @@ export function contextLines(context: ContextFill, history: number[]): string[] 
     const per = `1ターンあたり約 +${Math.max(1, Math.round(growth))}%`
     lines.push(next ? `${per}・あと ${Math.ceil((next - pct) / growth)} ターンほどで ${next}%` : per)
   }
+  if (valve > 0 && context.tokens !== undefined) {
+    const left = valve - context.tokens
+    lines.push(left > 0 ? `自動圧縮の基準 約 ${tokens(valve)} まで あと ${tokens(left)}` : `自動圧縮の基準 約 ${tokens(valve)} を超えています`)
+  }
 
   return lines
+}
+
+// Read the compaction window once the fill makes it worth knowing.
+export const VALVE_FROM = 50
+export const VALVE_WARN = 0.9
+const VALVE_REARM = 0.8
+
+// Whether to give the last warning now, and whether it stands given afterwards.
+// A fill that falls well under the window (a compaction) arms it again.
+export function valveStep(tokensUsed: number | undefined, valve: number, wasWarned: boolean): { warn?: number; isWarned: boolean } {
+  if (tokensUsed === undefined || valve <= 0) return { isWarned: wasWarned }
+  const share = tokensUsed / valve
+  if (share >= VALVE_WARN && !wasWarned) return { warn: Math.floor(share * 100), isWarned: true }
+
+  return { isWarned: share < VALVE_REARM ? false : wasWarned }
+}
+
+export function valveToast(share: number): string {
+  return `まもなく自動で圧縮されます（基準の ${share}%）。区切りのよいところで /compact をおすすめします。`
+}
+
+export const BREAK_FROM = 50
+const BREAK_STEP = 10
+
+// Whether a break in the work is worth a notice at this fill: once past 50%, then again only ten points on.
+export function breakStep(pct: number | undefined, isBreak: boolean, notified: number): { notify: boolean; notified: number } {
+  if (pct === undefined) return { notify: false, notified }
+  if (pct < BREAK_FROM) return { notify: false, notified: 0 }
+  if (isBreak && (notified === 0 || pct >= notified + BREAK_STEP)) return { notify: true, notified: pct }
+
+  return { notify: false, notified }
+}
+
+export function breakToast(pct: number): string {
+  return `区切りどきです（文脈 ${pct}%）。続ける前に /compact か /clear を検討してください。`
 }
 
 // What was announced for a window, kept across sessions so each is said once.

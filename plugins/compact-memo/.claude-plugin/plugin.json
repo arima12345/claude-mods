@@ -1,0 +1,1 @@
+{ "name": "compact-memo", "version": "0.1.0", "description": "会話の圧縮の直前にゴール・やることの残り・変更中のファイル・未解決の問題をメモに残し、圧縮後に Claude へ渡し直す", "author": { "name": "arima12345" }, "types": "./types/index.d.ts" }
