@@ -27,26 +27,42 @@ export const running = (agents: SubAgent[]) => agents.filter(a => a.endedAt === 
 
 // --- Commands ---
 
+// Each pattern reads a command from its start: `rg pytest src` searches, and `cat jest.config.js` reads.
 const TESTS = [
-  /\b(npm|pnpm|yarn|bun)\s+(run\s+)?test\b/,
-  /\b(vitest|jest|mocha|ava|playwright\s+test)\b/,
-  /\bpytest\b|\bpython3?\s+-m\s+(pytest|unittest)\b/,
-  /\b(cargo|go|dotnet|deno|swift|mix|flutter)\s+test\b/,
-  /\b(mvn|gradlew?|\.\/gradlew)\s+\S*test\b/i,
-  /\bclaude\s+plugin\s+test\b/,
-  /\brspec\b|\bphpunit\b/,
+  /^(npm|pnpm|yarn|bun)\s+(run\s+)?test\b/,
+  /^(vitest|jest|mocha|ava)\b/,
+  /^playwright\s+test\b/,
+  /^pytest\b/,
+  /^python3?\s+-m\s+(pytest|unittest)\b/,
+  /^(cargo|go|dotnet|deno|swift|mix|flutter)\s+test\b/,
+  /^(mvn|gradlew?|\.[\\/]gradlew)\s+\S*test\b/i,
+  /^claude\s+plugin\s+test\b/,
+  /^(rspec|phpunit)\b/,
 ]
 
 const CHECKS = [
-  /\btsc\b/,
-  /\b(eslint|biome|oxlint|prettier\s+--check|ruff|mypy|pyright|flake8|clippy|golangci-lint)\b/,
-  /\b(npm|pnpm|yarn|bun)\s+(run\s+)?(lint|typecheck|type-check|check|build)\b/,
-  /\bclaude\s+plugin\s+validate\b/,
+  /^tsc\b/,
+  /^(eslint|biome|oxlint|ruff|mypy|pyright|flake8|golangci-lint)\b/,
+  /^python3?\s+-m\s+(mypy|ruff|pyright|flake8)\b/,
+  /^prettier\b.*\s--check\b/,
+  /^cargo\s+clippy\b/,
+  /^(npm|pnpm|yarn|bun)\s+(run\s+)?(lint|typecheck|type-check|check|build)\b/,
+  /^claude\s+plugin\s+validate\b/,
 ]
 
+// What may stand before the command itself: variables, and the runners that only start it.
+const LEADS = /^(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)|env|sudo|time|npx|bunx|cross-env|pnpm\s+(?:exec|dlx)|yarn\s+dlx|uv\s+run|poetry\s+run|bundle\s+exec)\s+)*/
+
+// The commands a line runs, one per `&&`, `||`, `;`, `|` or line, each without what leads it.
+function commandsIn(line: string): string[] {
+  return line.split(/&&|\|\||[;|\n]/).map(part => part.trim().replace(LEADS, ''))
+}
+
 export function classify(command: string): 'test' | 'check' | undefined {
-  if (TESTS.some(re => re.test(command))) return 'test'
-  if (CHECKS.some(re => re.test(command))) return 'check'
+  // A commit's message may well say "test": the commit is logged as one, never as a run.
+  const parts = commandsIn(command).filter(part => !isCommit(part))
+  if (parts.some(part => TESTS.some(re => re.test(part)))) return 'test'
+  if (parts.some(part => CHECKS.some(re => re.test(part)))) return 'check'
 
   return undefined
 }
@@ -55,29 +71,47 @@ export function classify(command: string): 'test' | 'check' | undefined {
 export function maskCommand(command: string): string {
   const first = (command.trim().split('\n')[0] ?? '').trim()
   const masked = first
-    .replace(/\bBearer\s+\S+/gi, 'Bearer ***')
-    .replace(/((?:token|secret|password|passwd|api[-_]?key|auth)[\w-]*\s*[=:]\s*)(?!Bearer\b)("[^"]*"|'[^']*'|\S+)/gi, '$1***')
-    .replace(/\b(?:sk|ghp|gho|ghs|github_pat|xox[abps])[-_][A-Za-z0-9_-]{8,}/g, '***')
-    .replace(/[A-Za-z0-9+/_-]{32,}/g, '***')
+    // user:password in a URL: postgres://alice:hunter2@host, https://alice:pw@github.com
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, '$1***@')
+    // A header's credential, whatever its scheme: Authorization: Basic dXNl…
+    .replace(/(\bAuthorization\s*:\s*)((?:Basic|Bearer|Token|Digest|Negotiate)\s+)?[^\s"']+/gi, '$1$2***')
+    .replace(/\bBearer\s+(?!\*\*\*)[^\s"']+/gi, 'Bearer ***')
+    // curl -u alice:pw, --user alice:pw
+    .replace(/((?:^|\s)(?:-u|--user)\s+)[^\s:]+:\S+/g, '$1***')
+    .replace(/((?:token|secret|password|passwd|api[-_]?key|auth)[\w-]*\s*[=:]\s*)(?!(?:Basic|Bearer|Token|Digest|Negotiate)\b|\*\*\*)("[^"]*"|'[^']*'|\S+)/gi, '$1***')
+    // The same flags with the value after a space: --password hunter2, --token abc
+    .replace(/(--?[\w-]*(?:token|secret|password|passwd|api[-_]?key)\s+)(?!-)("[^"]*"|'[^']*'|\S+)/gi, '$1***')
+    .replace(/\b(?:sk|ghp|gho|ghs|ghu|github_pat|glpat|xox[abps])[-_][A-Za-z0-9_-]{8,}/g, '***')
+    .replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, '***')
+    .replace(/\bAIza[0-9A-Za-z_-]{35}\b/g, '***')
+    // A long run of letters and digits, as keys and hashes are. A path has slashes, and a
+    // name like test_payment_gateway_flow has no digits: both are kept, so two tests stay two.
+    .replace(/[A-Za-z0-9+=_-]{32,}/g, run => (/^[A-Za-z0-9]+$/.test(run) || (/\d/.test(run) && /[A-Za-z]/.test(run)) ? '***' : run))
 
   return masked.length > 80 ? `${masked.slice(0, 79)}…` : masked
 }
 
-// `git commit` prints "[branch abc1234] subject"; a root commit adds "(root-commit)".
+// `git commit` prints "[branch abc1234] subject": a root commit adds "(root-commit)" after the
+// branch, and a commit off any branch (a rebase, a detached checkout) says "[detached HEAD abc1234]".
 export function parseCommit(stdout: string): { hash: string; subject: string } | undefined {
-  const m = /^\[[^\]\s]+(?: \(root-commit\))? ([0-9a-f]{7,40})\] (.+)$/m.exec(stdout)
+  const m = /^\[[^\]\n]+? ([0-9a-f]{7,40})\] (.+)$/m.exec(stdout)
 
   return m?.[1] && m[2] ? { hash: m[1], subject: m[2].trim() } : undefined
 }
 
 export const isCommit = (command: string) => /\bgit\b[^|;&]*\bcommit\b/.test(command)
 
-type Ran = { isError?: boolean; result?: unknown }
+type Ran = { isError?: boolean; result?: unknown; text?: string }
+
+// An interrupted call comes back as an error whose result is only its text, never the tool's record:
+// the engine's own notice, read from its start so a failing test that mentions "interrupted" stays a failure.
+const INTERRUPTED = /^\s*\[Request interrupted by user\b/
 
 export function outcomeOf(ran: Ran): Outcome {
-  const result = (ran.result ?? {}) as { interrupted?: unknown; backgroundTaskId?: unknown }
+  const result = (typeof ran.result === 'object' && ran.result !== null ? ran.result : {}) as { interrupted?: unknown; backgroundTaskId?: unknown }
   if (typeof result.backgroundTaskId === 'string') return 'background'
   if (result.interrupted === true) return 'interrupted'
+  if (ran.isError && [ran.text, ran.result].some(s => typeof s === 'string' && INTERRUPTED.test(s))) return 'interrupted'
 
   return ran.isError ? 'fail' : 'pass'
 }

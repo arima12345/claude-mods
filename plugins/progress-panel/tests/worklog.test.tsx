@@ -161,7 +161,8 @@ test('commands are told apart as tests and checks', () => {
 
 test('secrets in a command are masked and long commands cut', () => {
   expect(maskCommand('API_KEY=abc123 npm test')).toBe('API_KEY=*** npm test')
-  expect(maskCommand('curl -H "Authorization: Bearer xyz" x')).toBe('curl -H "Authorization: Bearer *** x')
+  // The closing quote stays: only the credential is replaced.
+  expect(maskCommand('curl -H "Authorization: Bearer xyz" x')).toBe('curl -H "Authorization: Bearer ***" x')
   expect(maskCommand('gh auth login --with-token ghp_abcdefghijklmnop')).toBe('gh auth login --with-token ***')
   expect(maskCommand(`run ${'a'.repeat(40)}`)).toBe('run ***')
   expect(maskCommand('npm test\nsecond line')).toBe('npm test')

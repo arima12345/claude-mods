@@ -4,30 +4,28 @@ import type { EngineInterface, Register, SessionMeasureInput, Timer, ToolCallInp
 import type { Limit, LogEntry, Progress, SubAgent, Task, Usage } from '../types'
 import {
   LIMIT_LEVELS,
-  addSample,
+  breakToast,
   clockTime,
   contextLines,
-  contextStep,
   contextToast,
   contextToastMs,
-  VALVE_FROM,
-  breakStep,
-  breakToast,
-  valveStep,
-  valveToast,
   emptyUsage,
-  fiveHourPace,
   levelOf,
   limitLines,
   limitToast,
+  measureStep,
   meter,
-  nextHistory,
+  needsValve,
+  nextReset,
+  noticeFor,
   ordered,
   paceToast,
+  turnEndStep,
   usageStatus,
-  weeklyPace,
-  windowKey,
+  valveOf,
+  valveToast,
   type LimitNotice,
+  type MeasureStep,
 } from './usage'
 import {
   addEntry,
@@ -190,8 +188,9 @@ const SHELLS = new Set(['Bash', 'PowerShell'])
 const EDITS = new Set(['Edit', 'Write', 'NotebookEdit'])
 
 // Edits, tests, checks and commits, as the handoff needs them; a failed edit changed nothing.
+// A failed call may carry no result at all, and a failed test is still worth its line.
 async function noteLog($: EngineInterface, e: Call, ran: Ran): Promise<void> {
-  if (ran.result === undefined) return
+  if (ran.deny !== undefined) return
   const input = e as unknown as { command?: unknown; file_path?: unknown; notebook_path?: unknown; agentId?: unknown }
   const t = await $.clock.now()
   const agentId = typeof input.agentId === 'string' ? input.agentId : undefined
@@ -205,7 +204,7 @@ async function noteLog($: EngineInterface, e: Call, ran: Ran): Promise<void> {
   if (SHELLS.has(e.tool) && typeof input.command === 'string') {
     const kind = classify(input.command)
     if (kind) entries.push({ kind, t, command: maskCommand(input.command), outcome: outcomeOf(ran), agent })
-    const stdout = (ran.result as { stdout?: unknown }).stdout
+    const stdout = typeof ran.result === 'object' && ran.result !== null ? (ran.result as { stdout?: unknown }).stdout : undefined
     const commit = !ran.isError && isCommit(input.command) && typeof stdout === 'string' ? parseCommit(stdout) : undefined
     if (commit) entries.push({ kind: 'commit', t, ...commit, agent })
   }
@@ -214,64 +213,63 @@ async function noteLog($: EngineInterface, e: Call, ran: Ran): Promise<void> {
 
 type Measured = Pick<SessionMeasureInput, 'context' | 'rateLimits'>
 
+// Folds a measurement into the usage. The write starts from the value as it stands when it lands,
+// so a break notice written meanwhile at a turn's end is not lost.
 async function noteMeasure($: EngineInterface, e: Measured): Promise<void> {
   const t = await $.clock.now()
-  const before = await read($, usage)
   const limits = e.rateLimits.map((l): Limit => ({ kind: l.kind, percentUsed: l.percentUsed, resetsAt: l.resetsAt }))
-  const samples: Usage['samples'] = {}
-  const fast: Usage['fast'] = {}
-  for (const limit of limits) {
-    const kept = addSample(before.samples[limit.kind] ?? [], limit, t)
-    samples[limit.kind] = kept
-    const wasFast = before.fast[limit.kind] !== undefined
-    if (limit.kind === 'five_hour') {
-      const eta = fiveHourPace(kept, limit, t, wasFast)
-      if (eta !== undefined) fast[limit.kind] = eta
-    } else if (limit.kind === 'seven_day' && weeklyPace(limit, t, wasFast)) {
-      fast[limit.kind] = 0
-    }
-  }
+  const valveRead = needsValve(await read($, usage), e.context) ? await readValve($) : undefined
+  let out: MeasureStep | undefined
+  await update($, usage, cur => (out = measureStep(cur, { context: e.context, limits }, t, valveRead)).next)
+  if (out === undefined) return
 
-  const pct = e.context.percent
-  const step = pct === undefined ? { level: before.contextLevel } : contextStep(pct, before.contextLevel)
-  const valve = before.valve || (pct !== undefined && pct >= VALVE_FROM ? await readValve($) : 0)
-  const last = valveStep(e.context.tokens, valve, before.isValveWarned ?? false)
-  // Falling under 50% (a /compact) arms the break notice again; a break itself is judged at the turn's end.
-  const breaks = breakStep(pct, false, before.breakNotified ?? 0)
-  await update($, usage, () => ({
-    measuredAt: limits.length > 0 ? t : before.measuredAt,
-    limits,
-    context: { percent: pct, tokens: e.context.tokens, window: e.context.window },
-    samples,
-    fast,
-    contextHistory: pct === undefined ? before.contextHistory : nextHistory(before.contextHistory, pct),
-    contextLevel: step.level,
-    valve,
-    isValveWarned: last.isWarned,
-    breakNotified: breaks.notified,
-  }))
-
-  if (step.notify !== undefined) $.ui.toast(contextToast(step.notify), { timeoutMs: contextToastMs(step.notify) })
-  if (last.warn !== undefined) $.ui.toast(valveToast(last.warn), { timeoutMs: 20_000 })
-  await announceLimits($, limits, fast)
+  if (out.contextNotify !== undefined) $.ui.toast(contextToast(out.contextNotify), { timeoutMs: contextToastMs(out.contextNotify) })
+  if (out.valveWarn !== undefined) $.ui.toast(valveToast(out.valveWarn), { timeoutMs: 20_000 })
+  if (out.breakNotify !== undefined) $.ui.toast(breakToast(out.breakNotify), { timeoutMs: 15_000 })
+  await announceLimits($, limits, out.next.fast)
+  scheduleResetRedraw($, out.next.limits, t)
 }
 
-// Where automatic compaction starts: the window the context breakdown measures against,
-// estimated locally (no API call). 0 when it cannot be read; the next measurement tries again.
+// Where automatic compaction runs, from the context breakdown (estimated locally, no API call).
+// 0 when it cannot be read; the next measurement tries again.
 async function readValve($: EngineInterface): Promise<number> {
   const u = await $.session.usage({ breakdown: 'summary' }).catch(() => undefined)
 
-  return u?.context.breakdown?.rawMaxTokens ?? 0
+  return valveOf(u?.context.breakdown)
 }
 
 // At the end of a main turn: a break in the work past 50% is a good moment to compact.
 async function noteBreak($: EngineInterface): Promise<void> {
   const p = await read($, progress)
-  const u = await read($, usage)
-  const step = breakStep(u.context?.percent, isBreak(await read($, log), p.startedAt, p.tasks), u.breakNotified ?? 0)
-  if (!step.notify) return
-  await update($, usage, x => ({ ...x, breakNotified: step.notified }))
-  $.ui.toast(breakToast(step.notified), { timeoutMs: 15_000 })
+  const isBreakNow = isBreak(await read($, log), p.startedAt, p.tasks)
+  let notify: number | undefined
+  await update($, usage, cur => {
+    const step = turnEndStep(cur, isBreakNow)
+    notify = step.breakNotify
+
+    return step.next
+  })
+  if (notify !== undefined) $.ui.toast(breakToast(notify), { timeoutMs: 15_000 })
+}
+
+// A reset that passes while nothing happens would leave "18:40 回復" on show: redraw once it has.
+// Only the nearest reset within a day is waited for; the module's own timer, started over on reload.
+let resetTimer: Timer | undefined
+const RESET_WAIT_MAX = 24 * 60 * 60_000
+
+function scheduleResetRedraw($: EngineInterface, limits: Limit[], t: number): void {
+  const reset = nextReset(limits, t)
+  resetTimer?.cancel()
+  resetTimer = undefined
+  if (reset === undefined || reset - t > RESET_WAIT_MAX) return
+  resetTimer = $.clock.after(reset - t + 1000, () => {
+    resetTimer = undefined
+    void $.clock
+      .now()
+      .then(n => update($, now, () => n))
+      .then(() => refreshStatus($))
+      .catch(() => {})
+  })
 }
 
 async function announceLimits($: EngineInterface, limits: Limit[], fast: Usage['fast']): Promise<void> {
@@ -279,9 +277,8 @@ async function announceLimits($: EngineInterface, limits: Limit[], fast: Usage['
   const notices = { ...(((await $.store.get(NOTICES)) ?? {}) as Record<string, LimitNotice>) }
   let isChanged = false
   for (const limit of limits) {
-    const key = windowKey(limit)
     const was = notices[limit.kind]
-    const notice: LimitNotice = was && was.resetKey === key ? { ...was } : { resetKey: key, level: 0, isFastNotified: false }
+    const notice = noticeFor(was, limit)
     const level = levelOf(limit.percentUsed, LIMIT_LEVELS)
     if (level > notice.level) {
       const text = limitToast(limit, level)
@@ -427,6 +424,8 @@ export const register: Register = on => {
     const t = await $.clock.now()
     await update($, agents, agentsForNewTurn)
     await update($, now, () => t)
+    // New work began: a break the last turn ended at no longer waits for its fill.
+    await update($, usage, cur => (cur.isBreakPending ? { ...cur, isBreakPending: false } : cur))
     await update($, progress, p => ({
       ...p,
       isWorking: true,
@@ -519,6 +518,12 @@ export const register: Register = on => {
             {contextLines(u.context, u.contextHistory, u.valve).map(line => (
               <Text dimColor>{line}</Text>
             ))}
+          </Box>
+        )}
+        {u.context && ctx === undefined && u.contextHistory.length > 0 && (
+          <Box flexDirection="column" marginTop={1}>
+            <Text bold>コンテキスト —</Text>
+            <Text dimColor>次の応答で更新します</Text>
           </Box>
         )}
         {subs.length > 0 && (

@@ -1,4 +1,4 @@
-import type { ContextFill, Limit, Sample, Usage } from '../types'
+import type { ContextFill, ContextReading, Limit, Sample, Usage } from '../types'
 
 const MINUTE = 60_000
 const HOUR = 60 * MINUTE
@@ -19,11 +19,11 @@ export const CONTEXT_LEVELS = [40, 50, 60] as const
 
 const pad = (n: number) => String(n).padStart(2, '0')
 
-// Local wall-clock time, as the person reads it.
+// Local wall-clock time, as the person reads it: HH:MM.
 export function clockTime(ms: number): string {
   const d = new Date(ms)
 
-  return `${d.getHours()}:${pad(d.getMinutes())}`
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
 export function monthDay(ms: number): string {
@@ -46,7 +46,19 @@ function resetTime(limit: Limit): number | undefined {
   return Number.isNaN(t) ? undefined : t
 }
 
-// The reset time to the nearest ten minutes: a few seconds' drift between responses is the same window.
+// Responses report a window's reset with a few seconds' drift: resets this close are one window.
+const RESET_SLACK = 10 * MINUTE
+
+export function sameReset(a: string | undefined, b: string | undefined): boolean {
+  const ta = a ? Date.parse(a) : NaN
+  const tb = b ? Date.parse(b) : NaN
+  // A window that names no reset, or one that cannot be read, is only itself.
+  if (Number.isNaN(ta) || Number.isNaN(tb)) return (a ?? '') === (b ?? '')
+
+  return Math.abs(ta - tb) < RESET_SLACK
+}
+
+// How 0.4.0 keyed a window in $.store: its reset to the nearest ten minutes. Read to carry old records over.
 export function windowKey(limit: Limit): number {
   const t = resetTime(limit)
 
@@ -67,7 +79,7 @@ const MAX_SAMPLES = 60
 
 export function addSample(samples: Sample[], limit: Limit, t: number): Sample[] {
   const resetsAt = limit.resetsAt ?? ''
-  const kept = samples.filter(s => s.resetsAt === resetsAt && s.t > t - SAMPLE_SPAN)
+  const kept = samples.filter(s => sameReset(s.resetsAt, resetsAt) && s.t > t - SAMPLE_SPAN)
 
   return [...kept, { t, pct: limit.percentUsed, resetsAt }].slice(-MAX_SAMPLES)
 }
@@ -77,7 +89,7 @@ export function addSample(samples: Sample[], limit: Limit, t: number): Sample[] 
 export function fiveHourPace(samples: Sample[], limit: Limit, now: number, wasFast: boolean): number | undefined {
   const reset = resetTime(limit)
   if (reset === undefined) return undefined
-  const recent = samples.filter(s => s.resetsAt === limit.resetsAt && s.t > now - SAMPLE_SPAN)
+  const recent = samples.filter(s => sameReset(s.resetsAt, limit.resetsAt) && s.t > now - SAMPLE_SPAN)
   const first = recent[0]
   const last = recent.at(-1)
   if (!first || !last || recent.length < 2) return undefined
@@ -139,7 +151,7 @@ export function limitLines(limit: Limit, fastEta: number | undefined, now: numbe
   ]
   if (fastEta !== undefined) {
     const eta = fastEta > 0 ? `このままだと ${clockTime(fastEta)} 頃に上限` : 'このままだと回復前に上限の見込み'
-    lines.push({ text: `  ペース速め：${eta}`, color: 'yellow' })
+    lines.push({ text: `  ⚠ ペース速め：${eta}`, color: 'yellow' })
   }
 
   return lines
@@ -159,6 +171,8 @@ export function usageStatus(usage: Usage, now: number): string {
   const parts = ordered(usage.limits).map(l => limitStatus(l, usage.fast[l.kind], now))
   const pct = usage.context?.percent
   if (pct !== undefined) parts.push(`文脈 ${pct}%${contextMark(pct)}`)
+  // A fill read before and none now (after a /compact, until the next response): a dash, not the old figure.
+  else if (usage.contextHistory.length > 0 && parts.length > 0) parts.push('文脈 —')
 
   return parts.join('・')
 }
@@ -212,28 +226,41 @@ export function paceToast(limit: Limit, eta: number): string {
     : `${name}の消費ペースが速めです。このままだと回復前に上限に達する見込みです。`
 }
 
-// The context's growth per measurement over the last few, when it grows.
-export function contextGrowth(history: number[]): number | undefined {
-  const first = history[0]
-  const last = history.at(-1)
-  if (first === undefined || last === undefined || history.length < 2) return undefined
-  const growth = (last - first) / (history.length - 1)
+const GROWTH_TURNS = 5
+
+// Readings kept from 0.4.0 were bare numbers with no turn: they start the history over.
+function readings(history: readonly unknown[]): ContextReading[] {
+  return history.filter((r): r is ContextReading => typeof r === 'object' && r !== null && 'turn' in r && 'pct' in r)
+}
+
+// The context's growth per main turn over the last five, when it grows.
+// Turns are counted, not measurements: a turn whose fill did not move adds no reading but still counts.
+export function contextGrowth(history: readonly unknown[]): number | undefined {
+  const kept = readings(history)
+  const last = kept.at(-1)
+  const first = kept.find(r => last !== undefined && r.turn >= last.turn - GROWTH_TURNS)
+  if (first === undefined || last === undefined || last.turn === first.turn) return undefined
+  const growth = (last.pct - first.pct) / (last.turn - first.turn)
 
   return growth > 0 ? growth : undefined
 }
 
-export function nextHistory(history: number[], pct: number): number[] {
-  const last = history.at(-1)
-
+// The latest fill of each turn: a measurement mid-turn (a rate limit that moved) stands in for that turn's.
+export function nextHistory(history: readonly unknown[], pct: number, turn: number): ContextReading[] {
+  const kept = readings(history)
+  const last = kept.at(-1)
   // A fall is a /compact or /clear: the growth before it no longer says anything.
-  return last !== undefined && pct < last ? [pct] : last === pct ? history : [...history, pct].slice(-5)
+  if (last !== undefined && pct < last.pct) return [{ turn, pct }]
+  const rest = last !== undefined && last.turn === turn ? kept.slice(0, -1) : kept
+
+  return [...rest, { turn, pct }].slice(-(GROWTH_TURNS + 1))
 }
 
 export function tokens(n: number): string {
   return n >= 1_000_000 ? `${Math.round(n / 100_000) / 10}M` : `${Math.round(n / 1000)}k`
 }
 
-export function contextLines(context: ContextFill, history: number[], valve = 0): string[] {
+export function contextLines(context: ContextFill, history: readonly unknown[], valve = 0): string[] {
   const pct = context.percent
   if (pct === undefined) return []
   const lines: string[] = []
@@ -253,8 +280,20 @@ export function contextLines(context: ContextFill, history: number[], valve = 0)
   return lines
 }
 
-// Read the compaction window once the fill makes it worth knowing.
+// Read where automatic compaction runs once the fill makes it worth knowing.
 export const VALVE_FROM = 50
+
+type Breakdown = { autoCompactThreshold?: number; isAutoCompactEnabled?: boolean; rawMaxTokens?: number }
+
+// Where automatic compaction runs, in tokens, from the context breakdown: its threshold, which sits
+// under the window it measures against; that window where a build reports no threshold; -1 when it is off.
+// 0 when nothing could be read, so a later measurement tries again.
+export function valveOf(breakdown: Breakdown | undefined): number {
+  if (breakdown === undefined) return 0
+  if (breakdown.isAutoCompactEnabled === false) return -1
+
+  return breakdown.autoCompactThreshold ?? breakdown.rawMaxTokens ?? 0
+}
 export const VALVE_WARN = 0.9
 const VALVE_REARM = 0.8
 
@@ -289,4 +328,107 @@ export function breakToast(pct: number): string {
 }
 
 // What was announced for a window, kept across sessions so each is said once.
-export type LimitNotice = { resetKey: number; level: number; isFastNotified: boolean }
+// `resetAt` is the window's reset in ms, 0 for a window that names none; 0.4.0 kept `resetKey` instead.
+export type LimitNotice = { resetAt?: number; resetKey?: number; level: number; isFastNotified: boolean }
+
+// The record a reading continues, or a fresh one for a window that reset since.
+export function noticeFor(was: LimitNotice | undefined, limit: Limit): LimitNotice {
+  const reset = resetTime(limit)
+  const fresh: LimitNotice = { resetAt: reset ?? 0, level: 0, isFastNotified: false }
+  if (!was) return fresh
+  const isSame =
+    was.resetAt === undefined
+      ? was.resetKey === windowKey(limit)
+      : reset === undefined
+        ? was.resetAt === 0
+        : was.resetAt !== 0 && Math.abs(was.resetAt - reset) < RESET_SLACK
+  if (!isSame) return fresh
+  const kept: LimitNotice = { resetAt: reset ?? 0, level: was.level, isFastNotified: was.isFastNotified }
+  // A window that names no reset (a gateway's spend limit) never resets by time: it is armed again once it falls well under.
+  if (reset === undefined && limit.percentUsed <= was.level - 5) return { ...kept, level: levelOf(limit.percentUsed, LIMIT_LEVELS) }
+
+  return kept
+}
+
+// The next reset among the windows that is still ahead, for redrawing once it passes while idle.
+export function nextReset(limits: Limit[], now: number): number | undefined {
+  const ahead = limits.map(resetTime).filter((t): t is number => t !== undefined && t > now)
+
+  return ahead.length > 0 ? Math.min(...ahead) : undefined
+}
+
+// Whether a measurement should read where automatic compaction runs: past 50%, and not yet read for this window.
+export function needsValve(cur: Usage, context: ContextFill): boolean {
+  const pct = context.percent
+  if (pct === undefined || pct < VALVE_FROM) return false
+
+  return !cur.valve || cur.valveWindow !== context.window
+}
+
+type Measurement = { context: ContextFill; limits: Limit[] }
+export type MeasureStep = { next: Usage; contextNotify?: number; valveWarn?: number; breakNotify?: number }
+
+// One measurement folded into the usage as it stands now. Pure: `update` may run it again on a write it lost.
+export function measureStep(cur: Usage, m: Measurement, t: number, valveRead: number | undefined): MeasureStep {
+  const hasLimits = m.limits.length > 0
+  const samples: Usage['samples'] = {}
+  const fast: Usage['fast'] = {}
+  for (const limit of m.limits) {
+    const kept = addSample(cur.samples[limit.kind] ?? [], limit, t)
+    samples[limit.kind] = kept
+    const wasFast = cur.fast[limit.kind] !== undefined
+    if (limit.kind === 'five_hour') {
+      const eta = fiveHourPace(kept, limit, t, wasFast)
+      if (eta !== undefined) fast[limit.kind] = eta
+    } else if (limit.kind === 'seven_day' && weeklyPace(limit, t, wasFast)) {
+      fast[limit.kind] = 0
+    }
+  }
+
+  const pct = m.context.percent
+  const step = pct === undefined ? { level: cur.contextLevel } : contextStep(pct, cur.contextLevel)
+
+  // Another model's window (a /model switch) has its own compaction point: forget the old one.
+  const isOtherWindow = cur.valveWindow !== undefined && cur.valveWindow !== m.context.window
+  let valve = isOtherWindow ? 0 : (cur.valve ?? 0)
+  let valveWindow = isOtherWindow ? undefined : cur.valveWindow
+  let wasWarned = isOtherWindow ? false : (cur.isValveWarned ?? false)
+  if (valveRead !== undefined && valveRead !== 0) {
+    valve = valveRead
+    valveWindow = m.context.window
+    if (valveRead !== cur.valve) wasWarned = false
+  }
+  const last = valveStep(m.context.tokens, valve, wasWarned)
+
+  // A break the last turn ended at is judged on the fill that turn reached, which may arrive only now.
+  // Falling under 50% (a /compact) arms the break notice again.
+  const breaks = breakStep(pct, cur.isBreakPending ?? false, cur.breakNotified ?? 0)
+
+  const next: Usage = {
+    ...cur,
+    // No windows is off a subscription: there is nothing to show, as the measurement says.
+    measuredAt: hasLimits ? t : cur.measuredAt,
+    limits: m.limits,
+    samples,
+    fast,
+    context: { percent: pct, tokens: m.context.tokens, window: m.context.window },
+    contextHistory: pct === undefined ? cur.contextHistory : nextHistory(cur.contextHistory, pct, cur.turns ?? 0),
+    contextLevel: step.level,
+    valve,
+    valveWindow,
+    isValveWarned: last.isWarned,
+    breakNotified: breaks.notified,
+    isBreakPending: pct === undefined ? cur.isBreakPending : false,
+  }
+
+  return { next, contextNotify: step.notify, valveWarn: last.warn, breakNotify: breaks.notify ? breaks.notified : undefined }
+}
+
+// The end of a main turn: one more turn counted, and a break in the work judged on the fill known now.
+// A break that cannot be told yet waits for the turn's own measurement (isBreakPending).
+export function turnEndStep(cur: Usage, isBreakNow: boolean): { next: Usage; breakNotify?: number } {
+  const step = breakStep(cur.context?.percent, isBreakNow, cur.breakNotified ?? 0)
+  const next: Usage = { ...cur, turns: (cur.turns ?? 0) + 1, breakNotified: step.notified, isBreakPending: isBreakNow && !step.notify }
+
+  return { next, breakNotify: step.notify ? step.notified : undefined }
+}

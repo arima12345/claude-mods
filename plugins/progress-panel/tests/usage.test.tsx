@@ -68,11 +68,12 @@ test('the status line carries the windows and the context fill', async ($, on) =
   await $.session.measure(measured({ ctx: 52 }))
   expect(w.statuses.at(-1)).toBe('待機中 ｜ 文脈 52%⚠')
 
-  // A window past its reset is stale until the next response.
+  // A window past its reset is stale until the next response. These readings carry no context fill,
+  // after ones that did: the context reads a dash rather than the old figure.
   await $.session.measure(measured({ five: 99 }))
   await w.clock.set(at(18, 45))
   await $.session.measure(measured({ five: 99 }))
-  expect(w.statuses.at(-1)).toBe('待機中 ｜ 5時間 回復済み')
+  expect(w.statuses.at(-1)).toBe('待機中 ｜ 5時間 回復済み・文脈 —')
 })
 
 test('each window is announced once at 80% and once at 95%, and again after it resets', async ($, on) => {
@@ -197,9 +198,14 @@ test('a context jump past several levels is announced once', () => {
 
 test('the pane shows the windows and the context, and no empty task list', async ($, on) => {
   const w = world(on)
-  await $.session.measure(measured({ five: 62, week: 35, ctx: 30 }))
-  await $.session.measure(measured({ five: 62, week: 35, ctx: 33 }))
-  await $.session.measure(measured({ five: 62, week: 35, ctx: 36 }))
+  on('turn.start', async (_$, e) => ({ turnId: e.turnId }) as never)
+  on('turn.complete', async () => ({ text: '' }))
+  // One reading at the end of each main turn, as the engine measures.
+  for (const [n, ctx] of [30, 33, 36].entries()) {
+    await $.turn.start({ text: '作業', turnId: `t${n}` })
+    await $.session.measure(measured({ five: 62, week: 35, ctx }))
+    await $.turn.complete({ reason: 'answer', answer: 'ok', durationMs: 1, isAborted: false, turnId: `t${n}` })
+  }
   expect(w.toasts).toEqual([])
 
   for (const surface of ['terminal', 'desktop'] as const) {
