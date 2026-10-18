@@ -1,0 +1,5 @@
+{
+  "name": "claude-mods",
+  "owner": { "name": "arima12345" },
+  "plugins": [{ "name": "progress-panel", "source": "./plugins/progress-panel" }]
+}
