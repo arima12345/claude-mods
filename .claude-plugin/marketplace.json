@@ -4,5 +4,6 @@
   "plugins": [{ "name": "progress-panel", "source": "./plugins/progress-panel" },
     { "name": "goal2", "source": "./plugins/goal2" },
     { "name": "edit-check", "source": "./plugins/edit-check" },
-    { "name": "compact-memo", "source": "./plugins/compact-memo" }]
+    { "name": "compact-memo", "source": "./plugins/compact-memo" },
+    { "name": "ja-reply", "source": "./plugins/ja-reply" }]
 }
