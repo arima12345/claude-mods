@@ -28,8 +28,18 @@ export type Usage = {
   contextLevel: number
 }
 
+// A subagent this session started; endedAt is 0 while it runs.
+export type SubAgent = { id: string; description: string; type: string; startedAt: number; endedAt: number }
+
+export type Outcome = 'pass' | 'fail' | 'interrupted' | 'background'
+// One line of the work log; `agent` names the subagent whose call it was.
+export type LogEntry =
+  | { kind: 'edit'; t: number; path: string; count: number; agent?: string }
+  | { kind: 'test' | 'check'; t: number; command: string; outcome: Outcome; agent?: string }
+  | { kind: 'commit'; t: number; hash: string; subject: string; agent?: string }
+
 declare module 'claude-code' {
   interface PluginState {
-    'progress-panel': { progress: Progress; now: number; usage: Usage }
+    'progress-panel': { progress: Progress; now: number; usage: Usage; agents: SubAgent[]; log: LogEntry[] }
   }
 }

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionMeasureInput, Timer, ToolCallInput, ToolCallResult } from 'claude-code'
 
-import type { Limit, Progress, Task, Usage } from '../types'
+import type { Limit, LogEntry, Progress, SubAgent, Task, Usage } from '../types'
 import {
   LIMIT_LEVELS,
   addSample,
@@ -24,6 +24,21 @@ import {
   windowKey,
   type LimitNotice,
 } from './usage'
+import {
+  addEntry,
+  agentEnded,
+  agentResumed,
+  agentStarted,
+  agentsForNewTurn,
+  classify,
+  entryLine,
+  isCommit,
+  maskCommand,
+  outcomeOf,
+  parseCommit,
+  running,
+  worklogMarkdown,
+} from './worklog'
 
 const PANE = 'progress-panel'
 const TITLE = 'Claudeの進捗'
@@ -39,6 +54,11 @@ const empty: Progress = {
 const progress = atom({ plugin: 'progress-panel', key: 'progress' } as const, empty)
 const now = atom({ plugin: 'progress-panel', key: 'now' } as const, 0)
 const usage = atom({ plugin: 'progress-panel', key: 'usage' } as const, emptyUsage)
+const agents = atom({ plugin: 'progress-panel', key: 'agents' } as const, [] as SubAgent[])
+const log = atom({ plugin: 'progress-panel', key: 'log' } as const, [] as LogEntry[])
+
+// The work log's latest lines the pane shows; /worklog has them all.
+const LOG_ROWS = 5
 
 // Kept in $.store so a window is announced once, whichever session sees it first.
 const NOTICES = 'limitNotices'
@@ -146,17 +166,44 @@ export function bar(done: number, total: number, width = 10): string {
 
 const MARKS = { completed: '✓', in_progress: '▶', pending: '・' } as const
 
-function summary(p: Progress): string {
+function summary(p: Progress, subagents = 0): string {
   const done = p.tasks.filter(t => t.status === 'completed').length
   const tasks = p.tasks.length > 0 ? ` ${done}/${p.tasks.length}` : ''
+  const subs = subagents > 0 ? `・サブ ${subagents}` : ''
 
-  return p.isWorking ? `作業中${tasks}・${p.action || '考え中'}` : `待機中${tasks}`
+  return p.isWorking ? `作業中${tasks}・${p.action || '考え中'}${subs}` : `待機中${tasks}${subs}`
 }
 
 async function refreshStatus($: EngineInterface): Promise<void> {
   const meter = usageStatus(await read($, usage), await $.clock.now())
-  const line = summary(await read($, progress))
+  const line = summary(await read($, progress), running(await read($, agents)))
   $.ui.status(meter ? `${line} ｜ ${meter}` : line)
+}
+
+const SHELLS = new Set(['Bash', 'PowerShell'])
+const EDITS = new Set(['Edit', 'Write', 'NotebookEdit'])
+
+// Edits, tests, checks and commits, as the handoff needs them; a failed edit changed nothing.
+async function noteLog($: EngineInterface, e: Call, ran: Ran): Promise<void> {
+  if (ran.result === undefined) return
+  const input = e as unknown as { command?: unknown; file_path?: unknown; notebook_path?: unknown; agentId?: unknown }
+  const t = await $.clock.now()
+  const agentId = typeof input.agentId === 'string' ? input.agentId : undefined
+  const agent = agentId ? ((await read($, agents)).find(a => a.id === agentId)?.type ?? 'サブ') : undefined
+  const entries: LogEntry[] = []
+
+  if (EDITS.has(e.tool) && !ran.isError) {
+    const path = typeof input.file_path === 'string' ? input.file_path : typeof input.notebook_path === 'string' ? input.notebook_path : ''
+    if (path) entries.push({ kind: 'edit', t, path, count: 1, agent })
+  }
+  if (SHELLS.has(e.tool) && typeof input.command === 'string') {
+    const kind = classify(input.command)
+    if (kind) entries.push({ kind, t, command: maskCommand(input.command), outcome: outcomeOf(ran), agent })
+    const stdout = (ran.result as { stdout?: unknown }).stdout
+    const commit = !ran.isError && isCommit(input.command) && typeof stdout === 'string' ? parseCommit(stdout) : undefined
+    if (commit) entries.push({ kind: 'commit', t, ...commit, agent })
+  }
+  if (entries.length > 0) await update($, log, l => entries.reduce(addEntry, l))
 }
 
 type Measured = Pick<SessionMeasureInput, 'context' | 'rateLimits'>
@@ -288,6 +335,10 @@ export const register: Register = on => {
       name: 'progress',
       description: 'Claudeの進捗パネルを開く',
     })
+    await $.command.register({
+      name: 'worklog',
+      description: 'このセッションの作業ログ（編集・テスト・コミット）を引き継ぎメモの下書きとして出す',
+    })
     void $.ui.open({ id: PANE, title: TITLE })
     // A resumed session already has figures: show them before the next response.
     void $.session
@@ -313,9 +364,36 @@ export const register: Register = on => {
     return { text: '進捗パネルを開きました。' }
   })
 
+  on('command.run', { command: 'worklog' }, async $ => ({ text: worklogMarkdown(await read($, log)) }))
+
+  // The panel only watches: a spawn goes ahead whatever happens here.
+  on('agent.spawn', async ($, e, next) => {
+    const spawned = await next(e)
+    if (!spawned.deny && spawned.agentId) {
+      const id = spawned.agentId
+      await $.clock
+        .now()
+        .then(t => update($, agents, list => agentStarted(list, { id, description: e.description, type: e.subagentType, startedAt: t })))
+        .then(() => refreshStatus($))
+        .catch(() => {})
+    }
+
+    return spawned
+  })
+
   on('turn.start', async ($, e, next) => {
-    if (e.agentId) return next(e)
+    if (e.agentId) {
+      const id = e.agentId
+      await $.clock
+        .now()
+        .then(t => update($, agents, list => agentResumed(list, id, t)))
+        .then(() => refreshStatus($))
+        .catch(() => {})
+
+      return next(e)
+    }
     const t = await $.clock.now()
+    await update($, agents, agentsForNewTurn)
     await update($, now, () => t)
     await update($, progress, p => ({
       ...p,
@@ -336,7 +414,16 @@ export const register: Register = on => {
   })
 
   on('turn.complete', async ($, e, next) => {
-    if (e.agentId) return next(e)
+    if (e.agentId) {
+      const id = e.agentId
+      await $.clock
+        .now()
+        .then(t => update($, agents, list => agentEnded(list, id, t)))
+        .then(() => refreshStatus($))
+        .catch(() => {})
+
+      return next(e)
+    }
     tick?.cancel()
     tick = undefined
     const t = await $.clock.now()
@@ -354,6 +441,7 @@ export const register: Register = on => {
     await noteStart($, e).catch(() => {})
     const ran = await next(e)
     await noteEnd($, e, ran).catch(() => {})
+    await noteLog($, e, ran).catch(() => {})
 
     return ran
   })
@@ -363,6 +451,8 @@ export const register: Register = on => {
     const p = await read($, progress)
     const n = await read($, now)
     const u = await read($, usage)
+    const subs = await read($, agents)
+    const entries = await read($, log)
     const ctx = u.context?.percent
     const done = p.tasks.filter(t => t.status === 'completed').length
     const time = p.isWorking ? elapsed(n - p.startedAt) : p.endedAt ? elapsed(p.endedAt - p.startedAt) : ''
@@ -395,6 +485,26 @@ export const register: Register = on => {
             </Text>
             {contextLines(u.context, u.contextHistory).map(line => (
               <Text dimColor>{line}</Text>
+            ))}
+          </Box>
+        )}
+        {subs.length > 0 && (
+          <Box flexDirection="column" marginTop={1}>
+            <Text bold>サブエージェント（実行中 {running(subs)}）</Text>
+            {subs.map(a => (
+              <Text dimColor={a.endedAt > 0}>
+                {a.endedAt > 0 ? '✓' : '▶'} {a.type}：{a.description} {elapsed((a.endedAt || Math.max(n, a.startedAt)) - a.startedAt)}
+              </Text>
+            ))}
+          </Box>
+        )}
+        {entries.length > 0 && (
+          <Box flexDirection="column" marginTop={1}>
+            <Text bold>作業ログ{entries.length > LOG_ROWS ? `（全 ${entries.length} 件・/worklog で全件）` : ''}</Text>
+            {entries.slice(-LOG_ROWS).map(entry => (
+              <Text color={'outcome' in entry && entry.outcome === 'fail' ? 'red' : undefined} dimColor={entry.kind === 'edit'}>
+                {entryLine(entry)}
+              </Text>
             ))}
           </Box>
         )}
