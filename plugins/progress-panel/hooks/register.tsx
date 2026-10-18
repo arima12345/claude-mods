@@ -35,11 +35,69 @@ const ACTIONS: Record<string, string> = {
   TaskUpdate: 'やることを更新中',
 }
 
+// MCP tools the desktop app and browsers bring, by `<server>__<tool>` or by server.
+const MCP_ACTIONS: Record<string, string> = {
+  ccd_turn__update_plan: 'やることリストを更新中',
+  ccd_turn__wrap_up: 'まとめを書いている',
+  Claude_Browser: 'ブラウザを操作中',
+  'claude-in-chrome': 'ブラウザを操作中',
+  playwright: 'ブラウザを操作中',
+  'computer-use': '画面を操作中',
+}
+
+// Claude.ai connectors are served under an id, which says nothing to a person.
+const SERVER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
 export function describe(tool: string): string {
   if (ACTIONS[tool]) return ACTIONS[tool]
-  if (tool.startsWith('mcp__')) return `外部ツールを使用中（${tool.split('__')[1] ?? tool}）`
+  if (tool.startsWith('mcp__')) {
+    const [, server = '', ...rest] = tool.split('__')
+    const name = rest.join('__')
+    const known = MCP_ACTIONS[`${server}__${name}`] ?? MCP_ACTIONS[server]
+    if (known) return known
+
+    return `外部ツールを使用中（${SERVER_ID.test(server) ? name : server}）`
+  }
 
   return `${tool} を使用中`
+}
+
+// The desktop app keeps its task list through these instead of TodoWrite.
+const PLAN_TOOL = 'mcp__ccd_turn__update_plan'
+const WRAP_UP_TOOL = 'mcp__ccd_turn__wrap_up'
+
+type PlanCall = { items?: unknown; advance?: unknown; done?: unknown; start?: unknown }
+
+// A whole new list, or steps moved by their 1-based place.
+export function applyPlan(tasks: Task[], call: PlanCall): Task[] {
+  let next = tasks
+  if (Array.isArray(call.items)) {
+    next = call.items.map((item, i): Task => {
+      const { content, status } = (item ?? {}) as { content?: unknown; status?: unknown }
+
+      return { id: String(i), title: String(content ?? ''), status: status === 'completed' || status === 'in_progress' ? status : 'pending' }
+    })
+  }
+  if (call.advance === true) {
+    const at = next.findIndex(t => t.status === 'in_progress')
+    const after = next.findIndex((t, i) => i > at && t.status === 'pending')
+    next = next.map((t, i): Task => (i === at ? { ...t, status: 'completed' } : i === after ? { ...t, status: 'in_progress' } : t))
+  }
+  if (Array.isArray(call.done)) {
+    const done = new Set(call.done.map(Number))
+    next = next.map((t, i): Task => (done.has(i + 1) ? { ...t, status: 'completed' } : t))
+  }
+  if (typeof call.start === 'number') {
+    const start = call.start
+    next = next.map((t, i): Task => (i + 1 === start ? { ...t, status: 'in_progress' } : t))
+  }
+
+  return next
+}
+
+// The wrap-up checks off the step still being worked on.
+export function wrapUp(tasks: Task[]): Task[] {
+  return tasks.map((t): Task => (t.status === 'in_progress' ? { ...t, status: 'completed' } : t))
 }
 
 export function elapsed(ms: number): string {
@@ -88,6 +146,9 @@ async function noteStart($: EngineInterface, e: Call): Promise<void> {
 
 async function noteEnd($: EngineInterface, e: Call, ran: Ran): Promise<void> {
   if (!ran.result || ran.isError) return
+
+  if (e.tool === PLAN_TOOL) await update($, progress, p => ({ ...p, tasks: applyPlan(p.tasks, e as PlanCall) }))
+  if (e.tool === WRAP_UP_TOOL) await update($, progress, p => ({ ...p, tasks: wrapUp(p.tasks) }))
 
   if (e.tool === 'TaskCreate') {
     const task = (ran.result as { task?: { id: string; subject: string } }).task

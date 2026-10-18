@@ -132,3 +132,34 @@ test('an API error restarts the work on a timer', async ($, on) => {
   await $.classic.StopFailure({ error: 'billing_error' })
   expect(f.toasts.at(-1)).toContain('一時停止')
 })
+
+test('a check command that keeps failing asks for another approach, then pauses', async ($, on) => {
+  const f = fake(on)
+  await goal2(f, () => $.command.run({ command: 'goal2', args: 'テストが通る --check "npm test"' } as never))
+  f.checkExit = 1
+  // Left untouched unless the judge is asked.
+  f.verdicts.push('{"verdict":"met","reason":"判定役","same":false}')
+  const blocks: (string | undefined)[] = []
+  for (let n = 1; n <= 6; n++) blocks.push((await $.classic.Stop(stop)).block)
+
+  expect(blocks[0]).toContain('確認コマンド「npm test」が通りませんでした')
+  expect(blocks[2]).not.toContain('別の方法を試してください')
+  expect(blocks[3]).toContain('別の方法を試してください')
+  expect(blocks[5]).toBeUndefined()
+  expect(f.toasts.at(-1)).toContain('一時停止')
+  // The judge was never asked: a failing check decides on its own.
+  expect(f.verdicts).toHaveLength(1)
+  expect((await goal2(f, () => $.command.run({ command: 'goal2', args: '' } as never))).text).toContain('一時停止中')
+})
+
+test('a check that passes in between starts the count over', async ($, on) => {
+  const f = fake(on)
+  await goal2(f, () => $.command.run({ command: 'goal2', args: 'テストが通る --check "npm test"' } as never))
+  f.checkExit = 1
+  for (let n = 1; n <= 3; n++) await $.classic.Stop(stop)
+  // Passing once (the judge still says unmet) resets the run of check failures.
+  f.checkExit = 0
+  await $.classic.Stop(stop)
+  f.checkExit = 1
+  for (let n = 1; n <= 3; n++) expect((await $.classic.Stop(stop)).block).not.toContain('別の方法を試してください')
+})
