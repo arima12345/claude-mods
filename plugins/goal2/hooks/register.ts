@@ -145,7 +145,9 @@ export const register: Register = (on, options) => {
 
     if (counted.check !== null) {
       const ran = await runCheck($, counted.check)
-      if (!ran.ok) return block($, counted, `確認コマンド「${counted.check}」が通りませんでした。\n${ran.output}`, false)
+      // The check still failing at the next stop counts as the same reason, so a stuck loop is noticed.
+      const failed = `確認コマンド「${counted.check}」が通りませんでした。`
+      if (!ran.ok) return block($, counted, `${failed}\n${ran.output}`, counted.lastReason === firstLine(failed))
     }
 
     const verdict = await judge($, counted, e.last_assistant_message ?? '')
