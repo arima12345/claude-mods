@@ -6,6 +6,7 @@
 | --- | --- |
 | [progress-panel](plugins/progress-panel) | Claude の進捗（作業中か、いま何をしているか、やることリストの進み具合）をひと目で見せるパネル |
 | [goal2](plugins/goal2) | `/goal` の改良版。本当に達成したときだけ終わり、エラーで止まっても自動で再開する |
+| [edit-check](plugins/edit-check) | ファイルを変更したら、作業を終える前にそのプロジェクトの型チェックや lint を自動で実行する |
 
 ## インストール
 

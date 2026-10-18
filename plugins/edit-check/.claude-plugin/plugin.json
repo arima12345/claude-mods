@@ -1,0 +1,10 @@
+{
+  "name": "edit-check",
+  "version": "0.1.0",
+  "description": "ファイルを変更したら、Claude が作業を終える前にそのプロジェクトの型チェックや lint を自動で実行する",
+  "author": { "name": "arima12345" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "timeoutSeconds": { "type": "number", "title": "チェック1件の制限時間（秒）", "description": "これを超えたチェックは打ち切って、通らなかったものとして扱う（最大600秒）", "default": 300 }
+  }
+}
