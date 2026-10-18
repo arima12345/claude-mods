@@ -52,8 +52,36 @@ export type LogEntry =
   | { kind: 'test' | 'check'; t: number; command: string; outcome: Outcome; agent?: string }
   | { kind: 'commit'; t: number; hash: string; subject: string; agent?: string }
 
+// What one session shares with the others through $.store, under `session:<id>`.
+export type SessionCard = {
+  id: string
+  // The working folder's last part, and its git branch ('' outside git).
+  folder: string
+  branch: string
+  // The person's latest request, its first line, masked and cut short.
+  request: string
+  isWorking: boolean
+  action: string
+  done: number
+  total: number
+  // The task being worked on; '' when none.
+  current: string
+  context?: number
+  updatedAt: number
+}
+// The other sessions as last read, and when.
+export type Others = { at: number; cards: SessionCard[] }
+
 declare module 'claude-code' {
   interface PluginState {
-    'progress-panel': { progress: Progress; now: number; usage: Usage; agents: SubAgent[]; log: LogEntry[] }
+    'progress-panel': {
+      progress: Progress
+      now: number
+      usage: Usage
+      agents: SubAgent[]
+      log: LogEntry[]
+      request: string
+      others: Others
+    }
   }
 }
