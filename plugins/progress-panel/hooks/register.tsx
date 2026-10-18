@@ -31,16 +31,18 @@ import {
   CARD_PREFIX,
   HEARTBEAT_MS,
   POLL_MS,
+  PRUNE_MS,
   PUBLISH_GAP_MS,
+  activeAtOf,
   asCard,
   cardKey,
   cardOf,
   cardShape,
   folderOf,
-  isPrunable,
   othersSection,
   othersStatus,
   requestLine,
+  writtenAt,
 } from './sessions'
 import {
   addEntry,
@@ -207,10 +209,15 @@ async function refreshStatus($: EngineInterface): Promise<void> {
 // The module's own values, started over on reload.
 let isInteractive = false
 let isEnded = false
+// Moved on at every end: a write begun before it must not put the old card back.
+let epoch = 0
 let branch = ''
 let isBranchRead = false
+let branchRead: Promise<void> | undefined
 let lastShape = ''
 let lastPublishedAt = 0
+// When sharing began, for a session that has not worked yet.
+let since = 0
 let pending: Timer | undefined
 let heartbeat: Timer | undefined
 let poll: Timer | undefined
@@ -224,29 +231,47 @@ async function isSharing($: EngineInterface): Promise<boolean> {
 }
 
 // Writes this session's card; a heartbeat writes it even when nothing changed.
-async function publishNow($: EngineInterface, isHeartbeat = false): Promise<void> {
+// The folder and branch are the project's (`root`): a hook's `cwd` is a subagent's own, and a shell `cd` moves it.
+async function publishNow($: EngineInterface, isHeartbeat = false, awaitBranch = false): Promise<void> {
   if (!(await isSharing($))) return
-  if (!isBranchRead) await readBranch($)
+  const at = epoch
+  if (!isBranchRead) {
+    // Only the start waits for git; anywhere else the card goes now and again once the branch is known.
+    if (awaitBranch) await refreshBranch($)
+    else void refreshBranch($).then(() => schedulePublish($)).catch(() => {})
+  }
   const t = await $.clock.now()
-  const card = cardOf(await read($, progress), {
-    id: await $.session.id(),
-    folder: folderOf(await $.session.cwd()),
+  if (since === 0) since = t
+  const p = await read($, progress)
+  const id = await $.session.id()
+  const card = cardOf(p, {
+    id,
+    folder: folderOf(await projectRoot($)),
     branch,
     request: await read($, request),
     context: (await read($, usage)).context?.percent,
     updatedAt: t,
+    activeAt: activeAtOf(p, since),
   })
   const shape = cardShape(card)
   if (!isHeartbeat && shape === lastShape) return
+  // The session ended, or went on under a new id, while this card was being made.
+  if (isEnded || at !== epoch) return
   lastShape = shape
   lastPublishedAt = t
-  await $.store.set(cardKey(card.id), card)
+  await $.store.set(cardKey(id), card)
+  // An end that came while the write was on its way would find nothing to remove: take the card back.
+  if (isEnded || at !== epoch) await $.store.delete(cardKey(id)).catch(() => {})
 }
 
 // Changes in a row are written once the gap has passed, the state as it stands then.
 async function schedulePublish($: EngineInterface): Promise<void> {
-  if (pending !== undefined || !(await isSharing($))) return
-  const wait = lastPublishedAt + PUBLISH_GAP_MS - (await $.clock.now())
+  if (pending !== undefined) return
+  const isOn = await isSharing($)
+  const t = await $.clock.now()
+  // Checked again after the waits: two calls at once must not both start a timer.
+  if (!isOn || pending !== undefined) return
+  const wait = lastPublishedAt + PUBLISH_GAP_MS - t
   if (wait <= 0) return publishNow($)
   pending = $.clock.after(wait, () => {
     pending = undefined
@@ -254,14 +279,46 @@ async function schedulePublish($: EngineInterface): Promise<void> {
   })
 }
 
+// The project's folder; the session's own where a build cannot tell it.
+async function projectRoot($: EngineInterface): Promise<string> {
+  return $.session.root().catch(() => $.session.cwd())
+}
+
+// One read at a time; a read already on its way is joined.
+function refreshBranch($: EngineInterface): Promise<void> {
+  branchRead ??= readBranch($).finally(() => {
+    branchRead = undefined
+  })
+
+  return branchRead
+}
+
+// The branch the project is on. A read that fails or times out keeps the last one known;
+// a commit off any branch (a rebase, a detached checkout) shows as "ブランチ外" and its short hash.
 async function readBranch($: EngineInterface): Promise<void> {
-  const cwd = await $.session.cwd()
-  const ran = await $.process.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], { cwd, timeoutMs: 3000 }).catch(() => undefined)
-  branch = ran?.exitCode === 0 ? ran.stdout.trim() : ''
+  const cwd = await projectRoot($)
+  const git = (...args: string[]) => $.process.run(['git', ...args], { cwd, timeoutMs: 3000 }).catch(() => undefined)
+  const ran = await git('rev-parse', '--abbrev-ref', 'HEAD')
   isBranchRead = true
+  if (ran === undefined) return
+  if (ran.exitCode !== 0) {
+    if (/not a git repository/i.test(ran.stderr)) branch = ''
+
+    return
+  }
+  const name = ran.stdout.trim()
+  if (name !== 'HEAD') {
+    branch = name
+
+    return
+  }
+  const short = await git('rev-parse', '--short', 'HEAD')
+  branch = short?.exitCode === 0 ? `ブランチ外 ${short.stdout.trim()}` : 'ブランチ外'
 }
 
 // The other sessions' cards; one left too long is removed by whoever reads it.
+// An object this version cannot read as a card (another version's) is aged by its time, never removed
+// unread; a value that is no object is no card of any version, and goes.
 // The pane redraws when a card changed, or once a minute for the "4分前" it shows.
 async function readOthers($: EngineInterface): Promise<void> {
   if (!(await isSharing($))) return
@@ -269,12 +326,15 @@ async function readOthers($: EngineInterface): Promise<void> {
   const own = await $.session.id()
   const cards: SessionCard[] = []
   for (const key of (await $.store.keys()).filter(k => k.startsWith(CARD_PREFIX))) {
-    const card = asCard(await $.store.get(key))
-    if (card === undefined || isPrunable(card, t)) {
+    const value = await $.store.get(key)
+    const card = asCard(value)
+    const written = card?.updatedAt ?? writtenAt(value)
+    const isJunk = typeof value !== 'object' || value === null
+    if (isJunk || (written !== undefined && t - written >= PRUNE_MS)) {
       await $.store.delete(key).catch(() => {})
       continue
     }
-    if (card.id !== own) cards.push(card)
+    if (card !== undefined && card.id !== own) cards.push(card)
   }
   const was = await read($, others)
   if (JSON.stringify(was.cards) === JSON.stringify(cards) && Math.floor(was.at / 60_000) === Math.floor(t / 60_000)) return
@@ -282,8 +342,8 @@ async function readOthers($: EngineInterface): Promise<void> {
   await refreshStatus($)
 }
 
+// The timers come first: a first write or read that fails must not leave the session silent.
 async function startSharing($: EngineInterface): Promise<void> {
-  await publishNow($, true)
   heartbeat?.cancel()
   heartbeat = $.clock.every(HEARTBEAT_MS, () => {
     void publishNow($, true).catch(() => {})
@@ -292,7 +352,8 @@ async function startSharing($: EngineInterface): Promise<void> {
   poll = $.clock.every(POLL_MS, () => {
     void readOthers($).catch(() => {})
   })
-  await readOthers($)
+  await publishNow($, true, true).catch(() => {})
+  await readOthers($).catch(() => {})
 }
 
 // Where the person's own prompts come from; a mod's or a reminder's are not theirs.
@@ -505,29 +566,39 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // The session's card goes; after a /clear the process goes on under a new id and writes that.
+  // The session's card goes. After a /clear or a /resume the process goes on under another id, with no
+  // session.start for it: sharing goes on and writes that one. Anything else ends it for the process.
   on('session.end', async ($, e, next) => {
-    await $.store.delete(cardKey(e.sessionId)).catch(() => {})
+    // Set before any wait, so a write already on its way sees the end.
+    epoch += 1
     lastShape = ''
-    if (e.reason === 'clear') {
-      await update($, request, () => '').catch(() => {})
-    } else {
+    const goesOn = e.reason === 'clear' || e.reason === 'resume'
+    if (!goesOn) {
+      isEnded = true
       for (const timer of [pending, heartbeat, poll]) timer?.cancel()
       pending = heartbeat = poll = undefined
-      isEnded = true
+    }
+    await $.store.delete(cardKey(e.sessionId)).catch(() => {})
+    if (goesOn) {
+      since = 0
+      await update($, request, () => '').catch(() => {})
     }
 
     return next(e)
   })
 
-  // The person's latest request names the session for the others.
+  // The person's latest request names the session for the others: one that entered, and that has words.
   on('prompt.submit', async ($, e, next) => {
-    if (USER_ORIGINS.includes(e.origin.kind) && e.command === undefined && e.isMeta !== true) {
-      await update($, request, () => requestLine(e.text)).catch(() => {})
-      await schedulePublish($).catch(() => {})
+    const passed = await next(e)
+    if (passed.drop === undefined && USER_ORIGINS.includes(e.origin.kind) && e.command === undefined && e.isMeta !== true) {
+      const line = requestLine(passed.text ?? e.text)
+      if (line !== '') {
+        await update($, request, () => line).catch(() => {})
+        await schedulePublish($).catch(() => {})
+      }
     }
 
-    return next(e)
+    return passed
   })
 
   on('command.run', { command: 'progress' }, async $ => {
@@ -608,8 +679,8 @@ export const register: Register = on => {
     await update($, progress, p => ({ ...p, isWorking: false, endedAt: t, action: label }))
     await noteBreak($).catch(() => {})
     await refreshStatus($)
-    // A checkout during the turn shows in the branch from its end.
-    if (await isSharing($).catch(() => false)) await readBranch($).catch(() => {})
+    // A checkout during the turn shows in the branch from its end; the turn does not wait for git.
+    if (await isSharing($).catch(() => false)) void refreshBranch($).then(() => schedulePublish($)).catch(() => {})
     await schedulePublish($).catch(() => {})
 
     return next(e)
@@ -635,6 +706,7 @@ export const register: Register = on => {
     const entries = await read($, log)
     const o = await read($, others)
     const section = othersSection(o.cards, Math.max(n, o.at))
+    const isRemote = e.surface === 'mobile'
     const ctx = u.context?.percent
     const done = p.tasks.filter(t => t.status === 'completed').length
     const time = p.isWorking ? elapsed(n - p.startedAt) : p.endedAt ? elapsed(p.endedAt - p.startedAt) : ''
@@ -699,12 +771,17 @@ export const register: Register = on => {
         {o.cards.length > 0 && (
           <Box flexDirection="column" marginTop={1}>
             <Text bold>{section.heading}</Text>
-            {section.rows.map(row => (
-              <Text bold={row.isBold} dimColor={row.isDim} color={row.color}>
-                {row.text}
-              </Text>
-            ))}
-            {section.hidden > 0 && <Text dimColor>ほか {section.hidden} 件</Text>}
+            {isRemote ? (
+              // A phone draws through Remote Control: the other sessions' requests and tasks stay on this machine.
+              <Text dimColor>中身はこの画面には出しません（このパソコンの画面で見られます）</Text>
+            ) : (
+              section.rows.map(row => (
+                <Text bold={row.isBold} dimColor={row.isDim} color={row.color}>
+                  {row.text}
+                </Text>
+              ))
+            )}
+            {!isRemote && section.hidden > 0 && <Text dimColor>ほか {section.hidden} 件</Text>}
           </Box>
         )}
         {p.tasks.length > 0 && (

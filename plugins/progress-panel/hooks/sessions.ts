@@ -25,22 +25,39 @@ export function folderOf(cwd: string): string {
   return cwd.replace(/[\\/]+$/, '').split(/[\\/]/).at(-1) ?? ''
 }
 
-// The first line of a request, masked like a logged command and cut short.
-export function requestLine(text: string): string {
-  const first = text.split('\n').find(line => line.trim() !== '') ?? ''
-  const line = maskCommand(first)
+// A secret said in words rather than in a command: "パスワードは hunter2", "token: abc".
+const SAID_SECRET = /((?:パスワード|暗証番号|パスコード|トークン|シークレット|APIキー|password|passwd|passphrase|token|secret|api[-_ ]?key)\s*(?:は|が|を|:|：|=)\s*)(\S+)/gi
 
-  return line.length > REQUEST_CHARS ? `${line.slice(0, REQUEST_CHARS)}…` : line
+// A line shared with the other sessions: masked like a logged command, and like a secret in words.
+export function maskText(text: string): string {
+  return maskCommand(text).replace(SAID_SECRET, '$1***')
 }
 
-type Shared = { id: string; folder: string; branch: string; request: string; context?: number; updatedAt: number }
+// The first line of a request, masked and cut short, whole characters only.
+export function requestLine(text: string): string {
+  const first = text.split('\n').find(line => line.trim() !== '') ?? ''
+  const chars = Array.from(maskText(first))
+
+  return chars.length > REQUEST_CHARS ? `${chars.slice(0, REQUEST_CHARS).join('')}…` : chars.join('')
+}
+
+// When the session last did something: the start of the turn it works in, or the end of its last one.
+// One that has not worked yet counts from when it began sharing.
+export function activeAtOf(p: Progress, since: number): number {
+  return (p.isWorking ? p.startedAt : p.endedAt) || since
+}
+
+type Shared = { id: string; folder: string; branch: string; request: string; context?: number; updatedAt: number; activeAt: number }
 
 export function cardOf(p: Progress, s: Shared): SessionCard {
   const done = p.tasks.filter(t => t.status === 'completed').length
-  const current = p.tasks.find(t => t.status === 'in_progress')?.title ?? ''
+  const current = maskText(p.tasks.find(t => t.status === 'in_progress')?.title ?? '')
 
   return { ...s, isWorking: p.isWorking, action: p.action, done, total: p.tasks.length, current }
 }
+
+// When a card's session last did something; a 0.5.0 card only says when it was written.
+export const activeOf = (card: SessionCard) => card.activeAt ?? card.updatedAt
 
 // What a card holds, its time aside: a write is needed when this changes.
 export function cardShape(card: SessionCard): string {
@@ -67,7 +84,15 @@ export function asCard(value: unknown): SessionCard | undefined {
     current: String(c.current ?? ''),
     context: typeof c.context === 'number' ? c.context : undefined,
     updatedAt: c.updatedAt,
+    activeAt: typeof c.activeAt === 'number' ? c.activeAt : undefined,
   }
+}
+
+// When a stored value was written, if it says: a card of another version is aged by it, never thrown out unread.
+export function writtenAt(value: unknown): number | undefined {
+  const at = typeof value === 'object' && value !== null ? (value as { updatedAt?: unknown }).updatedAt : undefined
+
+  return typeof at === 'number' ? at : undefined
 }
 
 export function isStale(card: SessionCard, now: number): boolean {
@@ -80,9 +105,10 @@ export function isPrunable(card: SessionCard, now: number): boolean {
 
 const RANK = (card: SessionCard, now: number) => (isStale(card, now) ? 2 : card.isWorking ? 0 : 1)
 
-// Working first, then waiting, then not answering; the latest first within each.
+// Working first, then waiting, then not answering; within each, the one that did something last first.
+// The heartbeat's time would reorder idle sessions every minute, so it is not used here.
 export function sortCards(cards: SessionCard[], now: number): SessionCard[] {
-  return [...cards].sort((a, b) => RANK(a, now) - RANK(b, now) || b.updatedAt - a.updatedAt)
+  return [...cards].sort((a, b) => RANK(a, now) - RANK(b, now) || activeOf(b) - activeOf(a) || a.id.localeCompare(b.id))
 }
 
 export function counts(cards: SessionCard[], now: number): { working: number; waiting: number } {
@@ -119,7 +145,7 @@ export function cardRows(card: SessionCard, now: number): CardRow[] {
     ? [`作業中${tasks}`, card.action || '考え中']
     : [`待機中${tasks}`]
   if (card.context !== undefined) state.push(`文脈 ${card.context}%`)
-  if (!card.isWorking) state.push(ago(now - card.updatedAt))
+  if (!card.isWorking) state.push(ago(now - activeOf(card)))
   const rows: CardRow[] = [
     { text: `${card.isWorking ? '●' : '○'} ${name}`, isBold: true, color: card.isWorking ? 'yellow' : 'green' },
     { text: `  ${state.join('・')}` },

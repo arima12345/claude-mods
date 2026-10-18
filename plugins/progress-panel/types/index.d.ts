@@ -67,7 +67,10 @@ export type SessionCard = {
   // The task being worked on; '' when none.
   current: string
   context?: number
+  // When the card was last written: the heartbeat moves it, and it tells a live session from a gone one.
   updatedAt: number
+  // When the session last did something (its turn began or ended); a 0.5.0 card has none.
+  activeAt?: number
 }
 // The other sessions as last read, and when.
 export type Others = { at: number; cards: SessionCard[] }
