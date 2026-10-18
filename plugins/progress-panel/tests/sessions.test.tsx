@@ -74,7 +74,8 @@ const plan = (items: { content: string; status: string }[]) => ({ tool: 'mcp__cc
 test('a session shares its state, a run of changes at most every five seconds', async ($, on) => {
   const w = world(on)
   await $.session.start(start)
-  expect(w.store.get('session:s1')).toEqual(card('s1', { folder: 'claude-mods-session-board', branch: 'add-session-board' }))
+  // activeAt (0.5.1): it has not worked yet, so it counts from when sharing began.
+  expect(w.store.get('session:s1')).toEqual(card('s1', { folder: 'claude-mods-session-board', branch: 'add-session-board', activeAt: T0 }))
 
   await $.prompt.submit(typed('並行セッションの一覧を作って\n細かい条件は次のとおり'))
   await $.turn.start({ text: '並行セッションの一覧を作って', turnId: 't1' })
