@@ -1,12 +1,13 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-type Fakes = { verdicts: string[]; submitted: string[]; spawned: string[]; toasts: string[]; checkExit: number; clock: ReturnType<typeof mock.clock> }
+type Fakes = { verdicts: string[]; judged: string[]; submitted: string[]; spawned: string[]; toasts: string[]; checkExit: number; clock: ReturnType<typeof mock.clock> }
 
 // Stands in for the engine beneath the plugin: the judge model, the transcript, the verifier spawn.
 function fake(on: On): Fakes {
-  const f: Fakes = { verdicts: [], submitted: [], spawned: [], toasts: [], checkExit: 0, clock: mock.clock(on) }
-  on('model.complete', async () => {
+  const f: Fakes = { verdicts: [], judged: [], submitted: [], spawned: [], toasts: [], checkExit: 0, clock: mock.clock(on) }
+  on('model.complete', async (_$, e) => {
+    f.judged.push(e.prompt)
     const text = f.verdicts.shift() ?? '{"verdict":"not_met","reason":"まだ","same":false}'
 
     return { value: { isAnswered: true, text, usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } } as never
@@ -162,4 +163,64 @@ test('a check that passes in between starts the count over', async ($, on) => {
   await $.classic.Stop(stop)
   f.checkExit = 1
   for (let n = 1; n <= 3; n++) expect((await $.classic.Stop(stop)).block).not.toContain('別の方法を試してください')
+})
+
+// The person typing at the prompt, as the engine stamps it.
+const typed = (text: string) => ({ text, wait: false, origin: { kind: 'composer' } }) as const
+
+test('a question unrelated to the goal is answered and ends the turn, and the goal stays for later', async ($, on) => {
+  const f = fake(on)
+  await goal2(f, () => $.command.run({ command: 'goal2', args: '日記を追加できる --check "npm test"' } as never))
+  // The check still fails: an off-topic answer may end the turn all the same.
+  f.checkExit = 1
+
+  await $.prompt.submit(typed('今日の天気は?'))
+  f.verdicts.push('{"verdict":"off_topic","reason":"天気の質問への返事","same":false}')
+  const answered = await $.classic.Stop({ stop_hook_active: false, last_assistant_message: '晴れです' })
+  expect(answered.block).toBeUndefined()
+  expect(f.judged.at(-1)).toContain('今日の天気は?')
+  expect(f.judged.at(-1)).toContain('off_topic')
+  expect(f.toasts.at(-1)).toContain('ゴールはそのまま残っています')
+  // Not counted as a check, and the goal is still running.
+  const status = await goal2(f, () => $.command.run({ command: 'goal2', args: '' } as never))
+  expect(status.text).toContain('ゴール実行中 · 判定0/30')
+
+  // Back to the goal: judged as before, and the failing check keeps it working.
+  await $.prompt.submit(typed('日記の続きをお願い'))
+  f.verdicts.push('{"verdict":"not_met","reason":"保存がまだ","same":false}')
+  const back = await $.classic.Stop(stop)
+  expect(back.block).toContain('確認コマンド「npm test」が通りませんでした')
+  expect(f.judged.at(-1)).toContain('日記の続きをお願い')
+})
+
+test('off_topic counts for nothing when the turn was started by goal2 itself', async ($, on) => {
+  const f = fake(on)
+  await goal2(f, () => $.command.run({ command: 'goal2', args: 'アプリが起動する' } as never))
+  f.verdicts.push('{"verdict":"off_topic","reason":"関係ない","same":false}')
+  const kept = await $.classic.Stop(stop)
+  expect(kept.block).toContain('ユーザーに確認せず、そのまま作業を続けてください')
+  expect(f.judged.at(-1)).not.toContain('off_topic')
+
+  // A person's question, then goal2's own resume prompt: the question no longer stands.
+  await $.prompt.submit(typed('今日の天気は?'))
+  await goal2(f, () => $.command.run({ command: 'goal2', args: 'resume' } as never))
+  f.verdicts.push('{"verdict":"off_topic","reason":"関係ない","same":false}')
+  expect((await $.classic.Stop(stop)).block).toBeDefined()
+})
+
+test('needs_user and met keep their meaning when the person typed something', async ($, on) => {
+  const f = fake(on)
+  await goal2(f, () => $.command.run({ command: 'goal2', args: '公開する' } as never))
+  await $.prompt.submit(typed('公開まで進めて'))
+  f.verdicts.push('{"verdict":"met","reason":"公開できた","same":false}')
+  expect((await $.classic.Stop(stop)).block).toBeUndefined()
+  expect(f.spawned).toHaveLength(1)
+  // The judge was asked once: the early answer stands as the verdict.
+  expect(f.judged).toHaveLength(1)
+
+  await $.turn.complete({ reason: 'answer', answer: 'VERDICT: NOT_MET: ストアに出ていない', durationMs: 1, isAborted: false, turnId: 'v1', agentId: 'verifier-1' })
+  await $.prompt.submit(typed('パスワードは後で入れます'))
+  f.verdicts.push('{"verdict":"needs_user","reason":"ストアのパスワードが必要","same":false}')
+  expect((await $.classic.Stop(stop)).block).toBeUndefined()
+  expect((await goal2(f, () => $.command.run({ command: 'goal2', args: '' } as never))).text).toContain('一時停止中')
 })

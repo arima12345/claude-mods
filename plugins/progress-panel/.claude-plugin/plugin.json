@@ -1,1 +1,1 @@
-{ "name": "progress-panel", "version": "0.1.1", "description": "Claudeの進捗（作業中か、今何をしているか、タスクの進み具合）をひと目で見せるパネル", "types": "./types/index.d.ts" }
+{ "name": "progress-panel", "version": "0.1.2", "description": "Claudeの進捗（作業中か、今何をしているか、タスクの進み具合）をひと目で見せるパネル", "types": "./types/index.d.ts" }
