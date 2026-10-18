@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionMeasureInput, Timer, ToolCallInput, ToolCallResult } from 'claude-code'
 
-import type { Limit, LogEntry, Progress, SubAgent, Task, Usage } from '../types'
+import type { Limit, LogEntry, Others, Progress, SessionCard, SubAgent, Task, Usage } from '../types'
 import {
   LIMIT_LEVELS,
   breakToast,
@@ -27,6 +27,21 @@ import {
   type LimitNotice,
   type MeasureStep,
 } from './usage'
+import {
+  CARD_PREFIX,
+  HEARTBEAT_MS,
+  POLL_MS,
+  PUBLISH_GAP_MS,
+  asCard,
+  cardKey,
+  cardOf,
+  cardShape,
+  folderOf,
+  isPrunable,
+  othersSection,
+  othersStatus,
+  requestLine,
+} from './sessions'
 import {
   addEntry,
   agentEnded,
@@ -60,6 +75,8 @@ const now = atom({ plugin: 'progress-panel', key: 'now' } as const, 0)
 const usage = atom({ plugin: 'progress-panel', key: 'usage' } as const, emptyUsage)
 const agents = atom({ plugin: 'progress-panel', key: 'agents' } as const, [] as SubAgent[])
 const log = atom({ plugin: 'progress-panel', key: 'log' } as const, [] as LogEntry[])
+const request = atom({ plugin: 'progress-panel', key: 'request' } as const, '')
+const others = atom({ plugin: 'progress-panel', key: 'others' } as const, { at: 0, cards: [] } as Others)
 
 // The work log's latest lines the pane shows; /worklog has them all.
 const LOG_ROWS = 5
@@ -179,10 +196,107 @@ function summary(p: Progress, subagents = 0): string {
 }
 
 async function refreshStatus($: EngineInterface): Promise<void> {
-  const meter = usageStatus(await read($, usage), await $.clock.now())
+  const t = await $.clock.now()
+  const meter = usageStatus(await read($, usage), t)
   const line = summary(await read($, progress), running(await read($, agents)))
-  $.ui.status(meter ? `${line} ｜ ${meter}` : line)
+  const o = await read($, others)
+  $.ui.status([line, othersStatus(o.cards, Math.max(t, o.at)), meter].filter(Boolean).join(' ｜ '))
 }
+
+// Sharing this session's state with the other sessions on the machine, and reading theirs.
+// The module's own values, started over on reload.
+let isInteractive = false
+let isEnded = false
+let branch = ''
+let isBranchRead = false
+let lastShape = ''
+let lastPublishedAt = 0
+let pending: Timer | undefined
+let heartbeat: Timer | undefined
+let poll: Timer | undefined
+
+// A session someone watches shares: the REPL, or one a surface attached to (the desktop app,
+// which drives its sessions through the SDK). A plain -p run draws nowhere and stays out.
+async function isSharing($: EngineInterface): Promise<boolean> {
+  if (isEnded) return false
+
+  return isInteractive || (await $.session.surfaces()).length > 0
+}
+
+// Writes this session's card; a heartbeat writes it even when nothing changed.
+async function publishNow($: EngineInterface, isHeartbeat = false): Promise<void> {
+  if (!(await isSharing($))) return
+  if (!isBranchRead) await readBranch($)
+  const t = await $.clock.now()
+  const card = cardOf(await read($, progress), {
+    id: await $.session.id(),
+    folder: folderOf(await $.session.cwd()),
+    branch,
+    request: await read($, request),
+    context: (await read($, usage)).context?.percent,
+    updatedAt: t,
+  })
+  const shape = cardShape(card)
+  if (!isHeartbeat && shape === lastShape) return
+  lastShape = shape
+  lastPublishedAt = t
+  await $.store.set(cardKey(card.id), card)
+}
+
+// Changes in a row are written once the gap has passed, the state as it stands then.
+async function schedulePublish($: EngineInterface): Promise<void> {
+  if (pending !== undefined || !(await isSharing($))) return
+  const wait = lastPublishedAt + PUBLISH_GAP_MS - (await $.clock.now())
+  if (wait <= 0) return publishNow($)
+  pending = $.clock.after(wait, () => {
+    pending = undefined
+    void publishNow($).catch(() => {})
+  })
+}
+
+async function readBranch($: EngineInterface): Promise<void> {
+  const cwd = await $.session.cwd()
+  const ran = await $.process.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], { cwd, timeoutMs: 3000 }).catch(() => undefined)
+  branch = ran?.exitCode === 0 ? ran.stdout.trim() : ''
+  isBranchRead = true
+}
+
+// The other sessions' cards; one left too long is removed by whoever reads it.
+// The pane redraws when a card changed, or once a minute for the "4分前" it shows.
+async function readOthers($: EngineInterface): Promise<void> {
+  if (!(await isSharing($))) return
+  const t = await $.clock.now()
+  const own = await $.session.id()
+  const cards: SessionCard[] = []
+  for (const key of (await $.store.keys()).filter(k => k.startsWith(CARD_PREFIX))) {
+    const card = asCard(await $.store.get(key))
+    if (card === undefined || isPrunable(card, t)) {
+      await $.store.delete(key).catch(() => {})
+      continue
+    }
+    if (card.id !== own) cards.push(card)
+  }
+  const was = await read($, others)
+  if (JSON.stringify(was.cards) === JSON.stringify(cards) && Math.floor(was.at / 60_000) === Math.floor(t / 60_000)) return
+  await update($, others, () => ({ at: t, cards }))
+  await refreshStatus($)
+}
+
+async function startSharing($: EngineInterface): Promise<void> {
+  await publishNow($, true)
+  heartbeat?.cancel()
+  heartbeat = $.clock.every(HEARTBEAT_MS, () => {
+    void publishNow($, true).catch(() => {})
+  })
+  poll?.cancel()
+  poll = $.clock.every(POLL_MS, () => {
+    void readOthers($).catch(() => {})
+  })
+  await readOthers($)
+}
+
+// Where the person's own prompts come from; a mod's or a reminder's are not theirs.
+const USER_ORIGINS = ['composer', 'bridge', 'sdk']
 
 const SHELLS = new Set(['Bash', 'PowerShell'])
 const EDITS = new Set(['Edit', 'Write', 'NotebookEdit'])
@@ -369,6 +483,9 @@ export const register: Register = on => {
       description: 'このセッションの作業ログ（編集・テスト・コミット）を引き継ぎメモの下書きとして出す',
     })
     void $.ui.open({ id: PANE, title: TITLE })
+    isInteractive = e.isInteractive
+    isEnded = false
+    await startSharing($).catch(() => {})
     // A resumed session already has figures: show them before the next response.
     void $.session
       .usage()
@@ -383,6 +500,32 @@ export const register: Register = on => {
   on('session.measure', async ($, e, next) => {
     await noteMeasure($, e).catch(() => {})
     await refreshStatus($).catch(() => {})
+    await schedulePublish($).catch(() => {})
+
+    return next(e)
+  })
+
+  // The session's card goes; after a /clear the process goes on under a new id and writes that.
+  on('session.end', async ($, e, next) => {
+    await $.store.delete(cardKey(e.sessionId)).catch(() => {})
+    lastShape = ''
+    if (e.reason === 'clear') {
+      await update($, request, () => '').catch(() => {})
+    } else {
+      for (const timer of [pending, heartbeat, poll]) timer?.cancel()
+      pending = heartbeat = poll = undefined
+      isEnded = true
+    }
+
+    return next(e)
+  })
+
+  // The person's latest request names the session for the others.
+  on('prompt.submit', async ($, e, next) => {
+    if (USER_ORIGINS.includes(e.origin.kind) && e.command === undefined && e.isMeta !== true) {
+      await update($, request, () => requestLine(e.text)).catch(() => {})
+      await schedulePublish($).catch(() => {})
+    }
 
     return next(e)
   })
@@ -440,6 +583,7 @@ export const register: Register = on => {
       void $.clock.now().then(n => update($, now, () => n))
     })
     await refreshStatus($)
+    await schedulePublish($).catch(() => {})
 
     return next(e)
   })
@@ -464,6 +608,9 @@ export const register: Register = on => {
     await update($, progress, p => ({ ...p, isWorking: false, endedAt: t, action: label }))
     await noteBreak($).catch(() => {})
     await refreshStatus($)
+    // A checkout during the turn shows in the branch from its end.
+    if (await isSharing($).catch(() => false)) await readBranch($).catch(() => {})
+    await schedulePublish($).catch(() => {})
 
     return next(e)
   })
@@ -474,6 +621,7 @@ export const register: Register = on => {
     const ran = await next(e)
     await noteEnd($, e, ran).catch(() => {})
     await noteLog($, e, ran).catch(() => {})
+    await schedulePublish($).catch(() => {})
 
     return ran
   })
@@ -485,6 +633,8 @@ export const register: Register = on => {
     const u = await read($, usage)
     const subs = await read($, agents)
     const entries = await read($, log)
+    const o = await read($, others)
+    const section = othersSection(o.cards, Math.max(n, o.at))
     const ctx = u.context?.percent
     const done = p.tasks.filter(t => t.status === 'completed').length
     const time = p.isWorking ? elapsed(n - p.startedAt) : p.endedAt ? elapsed(p.endedAt - p.startedAt) : ''
@@ -544,6 +694,17 @@ export const register: Register = on => {
                 {entryLine(entry)}
               </Text>
             ))}
+          </Box>
+        )}
+        {o.cards.length > 0 && (
+          <Box flexDirection="column" marginTop={1}>
+            <Text bold>{section.heading}</Text>
+            {section.rows.map(row => (
+              <Text bold={row.isBold} dimColor={row.isDim} color={row.color}>
+                {row.text}
+              </Text>
+            ))}
+            {section.hidden > 0 && <Text dimColor>ほか {section.hidden} 件</Text>}
           </Box>
         )}
         {p.tasks.length > 0 && (
