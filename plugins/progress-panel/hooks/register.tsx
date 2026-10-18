@@ -10,6 +10,11 @@ import {
   contextStep,
   contextToast,
   contextToastMs,
+  VALVE_FROM,
+  breakStep,
+  breakToast,
+  valveStep,
+  valveToast,
   emptyUsage,
   fiveHourPace,
   levelOf,
@@ -32,6 +37,7 @@ import {
   agentsForNewTurn,
   classify,
   entryLine,
+  isBreak,
   isCommit,
   maskCommand,
   outcomeOf,
@@ -228,6 +234,10 @@ async function noteMeasure($: EngineInterface, e: Measured): Promise<void> {
 
   const pct = e.context.percent
   const step = pct === undefined ? { level: before.contextLevel } : contextStep(pct, before.contextLevel)
+  const valve = before.valve || (pct !== undefined && pct >= VALVE_FROM ? await readValve($) : 0)
+  const last = valveStep(e.context.tokens, valve, before.isValveWarned ?? false)
+  // Falling under 50% (a /compact) arms the break notice again; a break itself is judged at the turn's end.
+  const breaks = breakStep(pct, false, before.breakNotified ?? 0)
   await update($, usage, () => ({
     measuredAt: limits.length > 0 ? t : before.measuredAt,
     limits,
@@ -236,10 +246,32 @@ async function noteMeasure($: EngineInterface, e: Measured): Promise<void> {
     fast,
     contextHistory: pct === undefined ? before.contextHistory : nextHistory(before.contextHistory, pct),
     contextLevel: step.level,
+    valve,
+    isValveWarned: last.isWarned,
+    breakNotified: breaks.notified,
   }))
 
   if (step.notify !== undefined) $.ui.toast(contextToast(step.notify), { timeoutMs: contextToastMs(step.notify) })
+  if (last.warn !== undefined) $.ui.toast(valveToast(last.warn), { timeoutMs: 20_000 })
   await announceLimits($, limits, fast)
+}
+
+// Where automatic compaction starts: the window the context breakdown measures against,
+// estimated locally (no API call). 0 when it cannot be read; the next measurement tries again.
+async function readValve($: EngineInterface): Promise<number> {
+  const u = await $.session.usage({ breakdown: 'summary' }).catch(() => undefined)
+
+  return u?.context.breakdown?.rawMaxTokens ?? 0
+}
+
+// At the end of a main turn: a break in the work past 50% is a good moment to compact.
+async function noteBreak($: EngineInterface): Promise<void> {
+  const p = await read($, progress)
+  const u = await read($, usage)
+  const step = breakStep(u.context?.percent, isBreak(await read($, log), p.startedAt, p.tasks), u.breakNotified ?? 0)
+  if (!step.notify) return
+  await update($, usage, x => ({ ...x, breakNotified: step.notified }))
+  $.ui.toast(breakToast(step.notified), { timeoutMs: 15_000 })
 }
 
 async function announceLimits($: EngineInterface, limits: Limit[], fast: Usage['fast']): Promise<void> {
@@ -431,6 +463,7 @@ export const register: Register = on => {
       e.reason === 'answer' ? '返事を書き終えた' : e.reason === 'aborted' ? '中断された' : 'エラーで止まった'
     await update($, now, () => t)
     await update($, progress, p => ({ ...p, isWorking: false, endedAt: t, action: label }))
+    await noteBreak($).catch(() => {})
     await refreshStatus($)
 
     return next(e)
@@ -483,7 +516,7 @@ export const register: Register = on => {
             <Text bold color={ctx >= 60 ? 'red' : ctx >= 40 ? 'yellow' : undefined}>
               コンテキスト {ctx}% {meter(ctx)}
             </Text>
-            {contextLines(u.context, u.contextHistory).map(line => (
+            {contextLines(u.context, u.contextHistory, u.valve).map(line => (
               <Text dimColor>{line}</Text>
             ))}
           </Box>

@@ -3,5 +3,6 @@
   "owner": { "name": "arima12345" },
   "plugins": [{ "name": "progress-panel", "source": "./plugins/progress-panel" },
     { "name": "goal2", "source": "./plugins/goal2" },
-    { "name": "edit-check", "source": "./plugins/edit-check" }]
+    { "name": "edit-check", "source": "./plugins/edit-check" },
+    { "name": "compact-memo", "source": "./plugins/compact-memo" }]
 }

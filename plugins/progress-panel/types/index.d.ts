@@ -26,6 +26,12 @@ export type Usage = {
   contextHistory: number[]
   // The highest context threshold already announced.
   contextLevel: number
+  // Where automatic compaction starts, in tokens (the compaction window); absent until read.
+  valve?: number
+  // Whether the last warning before automatic compaction was given.
+  isValveWarned?: boolean
+  // The context fill at the last "good moment to compact" notice; 0 or absent when none.
+  breakNotified?: number
 }
 
 // A subagent this session started; endedAt is 0 while it runs.
