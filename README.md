@@ -4,7 +4,7 @@
 
 | mod | 内容 |
 | --- | --- |
-| [progress-panel](plugins/progress-panel) | Claude の進捗（作業中か、いま何をしているか、やることリストの進み具合）をひと目で見せるパネル |
+| [progress-panel](plugins/progress-panel) | Claude の進捗（作業中か、いま何をしているか、やることリストの進み具合）と、利用枠・コンテキストの残りをひと目で見せるパネル。使いすぎそうなときは知らせる |
 | [goal2](plugins/goal2) | `/goal` の改良版。本当に達成したときだけ終わり、エラーで止まっても自動で再開する |
 
 ## インストール

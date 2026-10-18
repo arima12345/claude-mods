@@ -1,7 +1,29 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, Timer, ToolCallInput, ToolCallResult } from 'claude-code'
+import type { EngineInterface, Register, SessionMeasureInput, Timer, ToolCallInput, ToolCallResult } from 'claude-code'
 
-import type { Progress, Task } from '../types'
+import type { Limit, Progress, Task, Usage } from '../types'
+import {
+  LIMIT_LEVELS,
+  addSample,
+  clockTime,
+  contextLines,
+  contextStep,
+  contextToast,
+  contextToastMs,
+  emptyUsage,
+  fiveHourPace,
+  levelOf,
+  limitLines,
+  limitToast,
+  meter,
+  nextHistory,
+  ordered,
+  paceToast,
+  usageStatus,
+  weeklyPace,
+  windowKey,
+  type LimitNotice,
+} from './usage'
 
 const PANE = 'progress-panel'
 const TITLE = 'Claudeの進捗'
@@ -16,6 +38,10 @@ const empty: Progress = {
 }
 const progress = atom({ plugin: 'progress-panel', key: 'progress' } as const, empty)
 const now = atom({ plugin: 'progress-panel', key: 'now' } as const, 0)
+const usage = atom({ plugin: 'progress-panel', key: 'usage' } as const, emptyUsage)
+
+// Kept in $.store so a window is announced once, whichever session sees it first.
+const NOTICES = 'limitNotices'
 
 // Tool names the model uses, said the way a person would.
 const ACTIONS: Record<string, string> = {
@@ -128,7 +154,74 @@ function summary(p: Progress): string {
 }
 
 async function refreshStatus($: EngineInterface): Promise<void> {
-  $.ui.status(summary(await read($, progress)))
+  const meter = usageStatus(await read($, usage), await $.clock.now())
+  const line = summary(await read($, progress))
+  $.ui.status(meter ? `${line} ｜ ${meter}` : line)
+}
+
+type Measured = Pick<SessionMeasureInput, 'context' | 'rateLimits'>
+
+async function noteMeasure($: EngineInterface, e: Measured): Promise<void> {
+  const t = await $.clock.now()
+  const before = await read($, usage)
+  const limits = e.rateLimits.map((l): Limit => ({ kind: l.kind, percentUsed: l.percentUsed, resetsAt: l.resetsAt }))
+  const samples: Usage['samples'] = {}
+  const fast: Usage['fast'] = {}
+  for (const limit of limits) {
+    const kept = addSample(before.samples[limit.kind] ?? [], limit, t)
+    samples[limit.kind] = kept
+    const wasFast = before.fast[limit.kind] !== undefined
+    if (limit.kind === 'five_hour') {
+      const eta = fiveHourPace(kept, limit, t, wasFast)
+      if (eta !== undefined) fast[limit.kind] = eta
+    } else if (limit.kind === 'seven_day' && weeklyPace(limit, t, wasFast)) {
+      fast[limit.kind] = 0
+    }
+  }
+
+  const pct = e.context.percent
+  const step = pct === undefined ? { level: before.contextLevel } : contextStep(pct, before.contextLevel)
+  await update($, usage, () => ({
+    measuredAt: limits.length > 0 ? t : before.measuredAt,
+    limits,
+    context: { percent: pct, tokens: e.context.tokens, window: e.context.window },
+    samples,
+    fast,
+    contextHistory: pct === undefined ? before.contextHistory : nextHistory(before.contextHistory, pct),
+    contextLevel: step.level,
+  }))
+
+  if (step.notify !== undefined) $.ui.toast(contextToast(step.notify), { timeoutMs: contextToastMs(step.notify) })
+  await announceLimits($, limits, fast)
+}
+
+async function announceLimits($: EngineInterface, limits: Limit[], fast: Usage['fast']): Promise<void> {
+  if (limits.length === 0) return
+  const notices = { ...(((await $.store.get(NOTICES)) ?? {}) as Record<string, LimitNotice>) }
+  let isChanged = false
+  for (const limit of limits) {
+    const key = windowKey(limit)
+    const was = notices[limit.kind]
+    const notice: LimitNotice = was && was.resetKey === key ? { ...was } : { resetKey: key, level: 0, isFastNotified: false }
+    const level = levelOf(limit.percentUsed, LIMIT_LEVELS)
+    if (level > notice.level) {
+      const text = limitToast(limit, level)
+      $.ui.toast(text, { timeoutMs: level >= 95 ? 20_000 : 8_000 })
+      // The desktop app has no native channel: the toast and the status line's mark stand in there.
+      if (level >= 95) void $.ui.notify(text, { title: '利用枠' }).catch(() => {})
+      notice.level = level
+    }
+    const eta = fast[limit.kind]
+    if (eta !== undefined && !notice.isFastNotified) {
+      $.ui.toast(paceToast(limit, eta), { timeoutMs: 10_000 })
+      notice.isFastNotified = true
+    }
+    if (JSON.stringify(was) !== JSON.stringify(notice)) {
+      notices[limit.kind] = notice
+      isChanged = true
+    }
+  }
+  if (isChanged) await $.store.set(NOTICES, notices)
 }
 
 type Call = ToolCallInput
@@ -196,6 +289,20 @@ export const register: Register = on => {
       description: 'Claudeの進捗パネルを開く',
     })
     void $.ui.open({ id: PANE, title: TITLE })
+    // A resumed session already has figures: show them before the next response.
+    void $.session
+      .usage()
+      .then(u => noteMeasure($, u))
+      .then(() => refreshStatus($))
+      .catch(() => {})
+
+    return next(e)
+  })
+
+  // The panel only watches: a failure here never stands in the way of the measurement.
+  on('session.measure', async ($, e, next) => {
+    await noteMeasure($, e).catch(() => {})
+    await refreshStatus($).catch(() => {})
 
     return next(e)
   })
@@ -255,6 +362,8 @@ export const register: Register = on => {
     const { Box, Text } = $.ui.resolve(e)
     const p = await read($, progress)
     const n = await read($, now)
+    const u = await read($, usage)
+    const ctx = u.context?.percent
     const done = p.tasks.filter(t => t.status === 'completed').length
     const time = p.isWorking ? elapsed(n - p.startedAt) : p.endedAt ? elapsed(p.endedAt - p.startedAt) : ''
 
@@ -269,11 +378,28 @@ export const register: Register = on => {
             {p.isWorking ? '経過' : '前回かかった時間'}: {time}・ツール {p.tools} 回
           </Text>
         )}
-        <Text> </Text>
-        {p.tasks.length === 0 ? (
-          <Text dimColor>やることリストはまだありません</Text>
-        ) : (
-          <Box flexDirection="column">
+        {u.limits.length > 0 && (
+          <Box flexDirection="column" marginTop={1}>
+            <Text bold>利用枠{u.measuredAt ? `（${clockTime(u.measuredAt)} 時点）` : ''}</Text>
+            {ordered(u.limits).flatMap(l => limitLines(l, u.fast[l.kind], Math.max(n, u.measuredAt))).map(line => (
+              <Text color={line.color} dimColor={line.isDim}>
+                {line.text}
+              </Text>
+            ))}
+          </Box>
+        )}
+        {u.context && ctx !== undefined && (
+          <Box flexDirection="column" marginTop={1}>
+            <Text bold color={ctx >= 60 ? 'red' : ctx >= 40 ? 'yellow' : undefined}>
+              コンテキスト {ctx}% {meter(ctx)}
+            </Text>
+            {contextLines(u.context, u.contextHistory).map(line => (
+              <Text dimColor>{line}</Text>
+            ))}
+          </Box>
+        )}
+        {p.tasks.length > 0 && (
+          <Box flexDirection="column" marginTop={1}>
             <Text bold>
               やること {bar(done, p.tasks.length)} {done}/{p.tasks.length}
             </Text>
