@@ -3,6 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Goal } from '../types'
 
 const GOAL = { plugin: 'goal2', key: 'goal' } as const
+const USER_PROMPT = { plugin: 'goal2', key: 'userPrompt' } as const
 const VERIFIER = 'goal2:verifier'
 
 // Waits before an automatic restart after an error: 1, 5, then 15 minutes.
@@ -13,6 +14,8 @@ const SAME_REASON_NUDGE = 3
 const SAME_REASON_PAUSE = 5
 const MAX_VERIFIER_FAILS = 3
 // Errors no restart can fix.
+// Where a prompt is the person's own words rather than goal2's or a notification's.
+const USER_ORIGINS = ['composer', 'bridge', 'sdk']
 const FATAL_ERRORS = ['authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required', 'billing_error', 'model_not_found', 'cloud_credential_error']
 
 const VERIFIER_PROMPT = `あなたはゴール達成の確認役です。作業した本人とは別の立場で、ゴールの条件が本当に満たされているかを実物で確かめます。
@@ -24,17 +27,23 @@ const VERIFIER_PROMPT = `あなたはゴール達成の確認役です。作業�
   VERDICT: MET
   VERDICT: NOT_MET: <足りない点を一文で>`
 
-type Verdict = { verdict: 'met' | 'not_met' | 'needs_user'; reason: string; same: boolean }
+type Verdict = { verdict: 'met' | 'not_met' | 'needs_user' | 'off_topic'; reason: string; same: boolean }
 
 // Set from the plugin's options each time the module loads.
 let judgeModel = 'haiku'
 let verifierModel = 'sonnet'
 let maxChecks = 30
 
+// goal2's own prompts are no question from the person.
+async function submitGoalPrompt($: EngineInterface, text: string): Promise<void> {
+  await $.state.set(USER_PROMPT, null)
+  await $.prompt.submit({ text })
+}
+
 // A command cannot start a turn while it runs, so the prompt goes out just after.
 function submitSoon($: EngineInterface, text: string): void {
   $.clock.after(100, async () => {
-    await $.prompt.submit({ text })
+    await submitGoalPrompt($, text)
   })
 }
 
@@ -129,12 +138,29 @@ export const register: Register = (on, options) => {
     return { text: `ゴールを設定しました: ${condition}${check === null ? '' : `\n確認コマンド: ${check}`}` }
   })
 
+  // The person's latest words, so a question unrelated to the goal can be answered and end the turn.
+  on('prompt.submit', async ($, e, next) => {
+    const isUser = USER_ORIGINS.includes(e.origin.kind) && e.command === undefined && e.isMeta !== true
+    await $.state.set(USER_PROMPT, isUser ? e.text : null)
+
+    return next(e)
+  })
+
   // Every time the main Claude tries to stop: judge, and keep it working while unmet.
   on('classic.Stop', async ($, e, next) => {
     const below = await next(e)
     if (e.agent_id !== undefined || below.block !== undefined) return below
     const goal = await getGoal($)
     if (goal === null || goal.status !== 'active') return below
+
+    // The person asked something themselves: whether it is about the goal is judged before any check runs.
+    const userPrompt = (await $.state.get(USER_PROMPT)).value ?? null
+    const early = userPrompt === null ? null : await judge($, goal, e.last_assistant_message ?? '', userPrompt)
+    if (early?.verdict === 'off_topic') {
+      $.ui.toast('ゴールと関係のない質問への返事なので、ここで止めました。ゴールはそのまま残っています（/goal2 resume で作業に戻ります）')
+
+      return below
+    }
 
     const counted: Goal = { ...goal, checks: goal.checks + 1, retries: 0 }
     if (counted.checks > maxChecks) {
@@ -150,7 +176,7 @@ export const register: Register = (on, options) => {
       if (!ran.ok) return block($, counted, `${failed}\n${ran.output}`, counted.lastReason === firstLine(failed))
     }
 
-    const verdict = await judge($, counted, e.last_assistant_message ?? '')
+    const verdict = early ?? (await judge($, counted, e.last_assistant_message ?? '', null))
     if (verdict.verdict === 'needs_user') {
       await pause($, { ...counted, lastReason: verdict.reason }, `あなたの判断が必要です: ${verdict.reason}`)
 
@@ -201,7 +227,7 @@ export const register: Register = (on, options) => {
       return done
     }
     await setGoal($, failed)
-    await $.prompt.submit({ text: continuePrompt(failed, `確認役が実物を確かめたところ、まだ達成されていませんでした。\n足りない点: ${missing}`) })
+    await submitGoalPrompt($, continuePrompt(failed, `確認役が実物を確かめたところ、まだ達成されていませんでした。\n足りない点: ${missing}`))
 
     return done
   })
@@ -229,7 +255,7 @@ export const register: Register = (on, options) => {
     $.clock.after(delay, async () => {
       const now = await getGoal($)
       if (now === null || now.setAt !== waiting.setAt || now.status !== 'active') return
-      await $.prompt.submit({ text: continuePrompt(now, 'エラーで止まっていた作業を自動で再開します。') })
+      await submitGoalPrompt($, continuePrompt(now, 'エラーで止まっていた作業を自動で再開します。'))
     })
 
     return below
@@ -252,7 +278,7 @@ async function block($: EngineInterface, goal: Goal, reason: string, same: boole
   return { block: `ゴール「${goal.condition}」はまだ達成されていません（判定${goal.checks}/${maxChecks}回目）。\n足りない点: ${reason}${nudge}\nユーザーに確認せず、そのまま作業を続けてください。` }
 }
 
-async function judge($: EngineInterface, goal: Goal, lastAnswer: string): Promise<Verdict> {
+async function judge($: EngineInterface, goal: Goal, lastAnswer: string, userPrompt: string | null): Promise<Verdict> {
   const messages = await $.session.messages()
   const recent = messages
     .slice(-20)
@@ -274,19 +300,19 @@ ${goal.condition}
 - ユーザーにしか決められないこと（好みの選択、パスワード、お金のかかる操作）で止まっているときだけ "needs_user"。
 - 「難しい」「後でやる」は "not_met" であり、あきらめる理由にはならない。
 - 前回の未達理由: ${goal.lastReason ?? 'なし'}。今回の未達理由が実質的に同じなら same を true にする。
-
+${userPrompt === null ? '' : `- ユーザーの最新の入力がゴールと関係のない質問や頼みごとで、最後の Claude の返事がそれに答えているなら "off_topic" にする（ゴールは残したまま、この返事で止まってよい）。ゴールの作業の続き、進み具合の確認、ゴールに関わる指示や質問は off_topic ではない。\n\nユーザーが自分で入力した最新の言葉:\n${clip(userPrompt, 1500)}\n`}
 最後の Claude の返事:
 ${clip(lastAnswer, 2000)}
 
 最近の会話:
 ${clip(recent, 12_000)}
 
-JSONだけで答えてください: {"verdict": "met" | "not_met" | "needs_user", "reason": "<一文>", "same": true | false}`
+JSONだけで答えてください: {"verdict": "met" | "not_met" | "needs_user"${userPrompt === null ? '' : ' | "off_topic"'}, "reason": "<一文>", "same": true | false}`
 
   const reply = await $.model.complete({ model: judgeModel, prompt, maxTokens: 400, timeoutMs: 60_000 })
   if (!reply.isAnswered) return { verdict: 'not_met', reason: '判定役が応答しませんでした。作業を続け、達成したら証拠を示してください', same: false }
 
-  return parseVerdict(reply.text)
+  return parseVerdict(reply.text, userPrompt !== null)
 }
 
 function parseArgs(args: string): { condition: string; check: string | null } {
@@ -296,11 +322,12 @@ function parseArgs(args: string): { condition: string; check: string | null } {
   return { condition: args.slice(0, found.index).trim(), check: (found[1] ?? found[2] ?? found[3] ?? '').trim() || null }
 }
 
-function parseVerdict(text: string): Verdict {
+// off_topic stands only where the judge was shown the person's own words.
+function parseVerdict(text: string, allowOffTopic: boolean): Verdict {
   const json = /\{[\s\S]*\}/.exec(text)?.[0]
   try {
     const parsed = JSON.parse(json ?? '') as Partial<Verdict>
-    const verdict = parsed.verdict === 'met' || parsed.verdict === 'needs_user' ? parsed.verdict : 'not_met'
+    const verdict = parsed.verdict === 'met' || parsed.verdict === 'needs_user' || (allowOffTopic && parsed.verdict === 'off_topic') ? parsed.verdict : 'not_met'
 
     return { verdict, reason: String(parsed.reason ?? '理由なし'), same: parsed.same === true }
   } catch {

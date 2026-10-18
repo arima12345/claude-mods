@@ -100,6 +100,11 @@ export function wrapUp(tasks: Task[]): Task[] {
   return tasks.map((t): Task => (t.status === 'in_progress' ? { ...t, status: 'completed' } : t))
 }
 
+// A list finished in an earlier turn belongs to that request: the next one starts empty.
+export function carryOver(tasks: Task[]): Task[] {
+  return tasks.length > 0 && tasks.every(t => t.status === 'completed') ? [] : tasks
+}
+
 export function elapsed(ms: number): string {
   const s = Math.max(0, Math.floor(ms / 1000))
   const m = Math.floor(s / 60)
@@ -212,6 +217,7 @@ export const register: Register = on => {
       endedAt: 0,
       action: '考え中',
       tools: 0,
+      tasks: carryOver(p.tasks),
     }))
     tick?.cancel()
     tick = $.clock.every(1000, () => {

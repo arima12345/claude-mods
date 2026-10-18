@@ -1,6 +1,6 @@
 {
   "name": "goal2",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "/goal の改良版。本当に達成したときだけ終わり、止まっても自動で再開する",
   "author": { "name": "arima12345" },
   "types": "./types/index.d.ts",

@@ -15,6 +15,6 @@ export type Goal = {
 
 declare module 'claude-code' {
   interface PluginState {
-    goal2: { goal: Goal | null }
+    goal2: { goal: Goal | null; userPrompt: string | null }
   }
 }
