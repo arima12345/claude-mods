@@ -13,9 +13,9 @@ const MAX_RETRIES = 6
 const SAME_REASON_NUDGE = 3
 const SAME_REASON_PAUSE = 5
 const MAX_VERIFIER_FAILS = 3
-// Errors no restart can fix.
 // Where a prompt is the person's own words rather than goal2's or a notification's.
 const USER_ORIGINS = ['composer', 'bridge', 'sdk']
+// Errors no restart can fix.
 const FATAL_ERRORS = ['authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required', 'billing_error', 'model_not_found', 'cloud_credential_error']
 
 const VERIFIER_PROMPT = `あなたはゴール達成の確認役です。作業した本人とは別の立場で、ゴールの条件が本当に満たされているかを実物で確かめます。
