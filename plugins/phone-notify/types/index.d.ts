@@ -9,6 +9,8 @@ declare module 'claude-code' {
       lastSent: Sent | null
       // Whether a failed send was already shown in this session.
       hasFailed: boolean
+      // Whether the main turn under way ended asking in the desktop app's next-step box (a question was sent for it).
+      asked: boolean
     }
   }
 }
