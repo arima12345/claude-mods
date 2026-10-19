@@ -1,0 +1,16 @@
+{
+  "name": "phone-notify",
+  "version": "0.1.0",
+  "description": "Claude が入力待ちで止まったとき、長い作業が終わったとき、エラーで止まったときに、ntfy でスマホへ通知する",
+  "author": { "name": "arima12345" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "topic": { "type": "string", "title": "ntfy のトピック名", "description": "スマホの ntfy アプリで購読しているトピック名。推測されにくい名前にする（例: arima-claude-7f3k9q）", "sensitive": true, "default": "" },
+    "server": { "type": "string", "title": "ntfy のサーバー", "description": "自分で ntfy を動かしている場合だけ変える", "default": "https://ntfy.sh" },
+    "doneAfterMinutes": { "type": "number", "title": "作業終了を知らせる最短時間（分）", "description": "これより短い作業の終わりは通知しない", "default": 3 },
+    "notifyWaiting": { "type": "boolean", "title": "入力待ちを知らせる", "description": "承認待ちや質問で止まったとき", "default": true },
+    "notifyDone": { "type": "boolean", "title": "作業の終わりを知らせる", "description": "長い作業が終わったとき", "default": true },
+    "notifyError": { "type": "boolean", "title": "エラーを知らせる", "description": "API エラーなどで止まったとき", "default": true },
+    "notifyMods": { "type": "boolean", "title": "ほかの mod の知らせを転送する", "description": "goal2 の一時停止や progress-panel の利用枠 95% など", "default": true }
+  }
+}
