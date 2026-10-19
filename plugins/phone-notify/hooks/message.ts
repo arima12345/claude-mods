@@ -36,8 +36,32 @@ export function failed(label: string, error: string): Note {
   return { title: head(label, 'エラーで止まりました'), message: cut(error || '不明なエラー', MAX_MESSAGE), priority: 4, tags: ['warning'] }
 }
 
-export function fromMod(label: string, title: string | undefined, message: string): Note {
-  return { title: head(label, cut(title || 'mod からの知らせ', 60)), message: cut(message, MAX_MESSAGE), priority: 4, tags: ['bell'] }
+// A mod's notice may carry the work itself (goal2's reasons name files, people, a goal): ntfy.sh's
+// topics are public to whoever knows the name, so only the notice's lead goes, unless the person asked
+// for the whole text. The lead is what comes before its first colon or bracket: "あなたの判断が必要です".
+export function modLead(message: string): string {
+  const one = cut(message, MAX_MESSAGE)
+  const at = one.search(/[:：（(]/)
+
+  return cut(at > 0 ? one.slice(0, at) : one, 60)
+}
+
+export function fromMod(label: string, title: string | undefined, message: string, isDetailed = false): Note {
+  const whole = cut(message, MAX_MESSAGE)
+  const lead = modLead(message)
+  const body = isDetailed || lead === whole ? whole : `${lead}（続きはパソコンで）`
+
+  return { title: head(label, cut(title || 'mod からの知らせ', 60)), message: body, priority: 4, tags: ['bell'] }
+}
+
+// Notifications that mean the person is waited for; idle_prompt is a finished reply, told by turn.complete.
+export const WAITING_KINDS = ['permission_prompt', 'elicitation_dialog']
+// Notifications that are no news to send: the idle wait, a sign-in that went through.
+export const QUIET_KINDS = ['idle_prompt', 'auth_success']
+
+// Any other kind the engine raises goes as a plain notice, not as a wait it may not be.
+export function notice(label: string, message: string): Note {
+  return { title: head(label, 'お知らせ'), message: cut(message || 'Claude Code からのお知らせ', MAX_MESSAGE), priority: 3, tags: ['bell'] }
 }
 
 export const keyOf = (note: Note) => `${note.title}\n${note.message}`
