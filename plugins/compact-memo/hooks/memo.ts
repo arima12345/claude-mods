@@ -10,43 +10,29 @@ export function withInstruction(instructions: string | undefined): string {
   return own ? `${own}\n\n${SUMMARY_INSTRUCTION}` : SUMMARY_INSTRUCTION
 }
 
-type Message = { role: 'user' | 'assistant'; text: string; toolResults?: readonly unknown[] }
-
 const cut = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1)}…` : text)
 
-// The last few things the person asked for; tool results, reminders and commands are not requests.
-export function recentRequests(messages: readonly Message[], count = 3): string[] {
-  return messages
-    .filter(m => m.role === 'user' && !(m.toolResults && m.toolResults.length > 0))
-    .map(m => m.text.trim())
-    .filter(text => text !== '' && !text.startsWith('<'))
-    .slice(-count)
-    .map(text => cut(text.replace(/\s+/g, ' '), 200))
+// Whether the last test or check of the session failed. Earlier failures fixed since say nothing.
+export function isLastCheckFailing(log: readonly LogSlice[]): boolean {
+  const last = [...log].reverse().find(e => e.kind === 'test' || e.kind === 'check')
+
+  return last?.outcome === 'fail'
 }
 
-// Commands whose last run failed, in the order they last ran.
-export function failingChecks(log: readonly LogSlice[]): string[] {
-  const last = new Map<string, string>()
-  for (const e of log) {
-    if ((e.kind === 'test' || e.kind === 'check') && e.command) {
-      last.delete(e.command)
-      last.set(e.command, e.outcome ?? '')
-    }
-  }
-
-  return [...last].filter(([, outcome]) => outcome === 'fail').map(([command]) => command)
-}
-
+// What only this moment knows and Claude cannot look up again; files and commands it can.
 export type Gathered = {
+  label: string
+  at: string
   goal: GoalSlice
-  requests: string[]
   tasks: TaskSlice[]
-  gitStatus: string[] | undefined
+  branch: string | undefined
   log: LogSlice[]
 }
 
 const MAX_MEMO = 6000
 const MAX_LINE = 200
+const MAX_TASKS = 30
+const MAX_COMMITS = 5
 const MARK: Record<string, string> = { in_progress: '▶', pending: '・' }
 
 // A heading and its lines, at most `max` of them, the rest counted.
@@ -57,34 +43,26 @@ function section(title: string, lines: string[], max: number): string[] {
   return [title, ...shown, ...(more > 0 ? [`（ほか ${more} 件）`] : [])]
 }
 
-export function buildMemo(g: Gathered): string {
-  const sections: string[][] = []
-
+// The memo, or `undefined` when there is nothing worth handing back: a branch name alone is no help.
+export function buildMemo(g: Gathered): string | undefined {
   const goal = g.goal?.condition.trim()
-  if (g.goal && goal) sections.push([`## いまのゴール（goal2${g.goal.status === 'paused' ? '・一時停止中' : ''}）`, cut(goal, 1000)])
-  else if (g.requests.length > 0) sections.push(section('## 直近の依頼', g.requests.map(r => `- ${r}`), 3))
-
   const open = g.tasks.filter(t => t.status !== 'completed')
-  if (open.length > 0) sections.push(section('## やることリストの残り', open.map(t => `${MARK[t.status] ?? '・'} ${t.title}`), 30))
+  const commits = g.log.filter(e => e.kind === 'commit' && e.hash).slice(-MAX_COMMITS).reverse()
+  const isFailing = isLastCheckFailing(g.log)
+  if (!goal && open.length === 0 && commits.length === 0 && !isFailing) return undefined
 
-  if (g.gitStatus && g.gitStatus.length > 0) {
-    sections.push(section('## 変更中のファイル（git status）', g.gitStatus, 40))
-  } else if (g.gitStatus === undefined) {
-    const edited = [...new Set(g.log.flatMap(e => (e.kind === 'edit' && e.path ? [e.path] : [])))]
-    if (edited.length > 0) sections.push(section('## このセッションで編集したファイル', edited.map(p => `- ${p}`), 40))
-  }
+  const sections: string[][] = []
+  if (g.goal && goal) sections.push([`## いまのゴール（goal2${g.goal.status === 'paused' ? '・一時停止中' : ''}）`, cut(goal, 1000)])
+  if (open.length > 0) sections.push(section('## やることリストの残り', open.map(t => `${MARK[t.status] ?? '・'} ${t.title}`), MAX_TASKS))
+  if (g.branch) sections.push(['## いまのブランチ', g.branch])
+  if (commits.length > 0) sections.push(['## このセッションのコミット（新しい5件）', ...commits.map(c => cut(`- ${(c.hash ?? '').slice(0, 7)} ${c.subject ?? ''}`, MAX_LINE))])
+  if (isFailing) sections.push(['## 気をつけること', '- 最後に実行したテスト・チェックが失敗のままです'])
 
-  const commits = g.log.filter(e => e.kind === 'commit' && e.hash)
-  if (commits.length > 0) sections.push(section('## このセッションのコミット', commits.map(c => `- ${(c.hash ?? '').slice(0, 7)} ${c.subject ?? ''}`), 20))
-
-  const failing = failingChecks(g.log)
-  if (failing.length > 0) sections.push(section('## 未解決の問題', failing.map(c => `- 失敗したままのテスト・チェック: \`${c}\``), 10))
-
+  const where = [g.label, g.at].filter(Boolean).join('・')
   const head = [
     '【圧縮前の退避メモ（compact-memo が自動で追加）】',
-    '会話が圧縮されたため、圧縮直前の状況を残します。要約と食い違う場合は、このメモと実際のファイル・git を優先して確かめてください。',
+    `${where ? `${where} の` : ''}圧縮の直前の状況です。要約と食い違う場合は、このメモと実際のファイル・git を優先して確かめてください。変更中のファイルは git status で確かめてください。`,
   ]
-  if (sections.length === 0) head.push('', '（残すべき状況は見つかりませんでした）')
 
   // Still past the limit: the section with the most text gives up lines, so every heading keeps some.
   const render = (isCut: boolean) => [...head, ...sections.flatMap(s => ['', ...s]), ...(isCut ? ['', '（長すぎるため一部を省きました）'] : [])].join('\n')
@@ -98,8 +76,4 @@ export function buildMemo(g: Gathered): string {
   }
 
   return cut(text, MAX_MEMO)
-}
-
-export function parseGitStatus(stdout: string): string[] {
-  return stdout.split('\n').map(l => l.trimEnd()).filter(l => l !== '')
 }
