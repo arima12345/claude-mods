@@ -1,5 +1,6 @@
 // A memo handed back after one compaction.
-export type MemoRecord = { at: number; trigger: string; text: string }
+// `session` is the session it was made in (absent before 0.4).
+export type MemoRecord = { at: number; trigger: string; text: string; session?: string }
 // One compaction as it happened, to learn where automatic compaction really starts.
 export type CompactionRecord = {
   at: number
@@ -12,6 +13,8 @@ export type CompactionRecord = {
   hasMemo?: boolean
   // Why no memo: nothing worth keeping, or the state could not be read.
   reason?: 'empty' | 'unread'
+  // The session it happened in (absent before 0.4).
+  session?: string
 }
 
 // The parts of other mods' state this one reads, when they are installed. It never writes them.

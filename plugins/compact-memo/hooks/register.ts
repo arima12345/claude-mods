@@ -6,7 +6,7 @@ import { buildMemo, withInstruction, type Gathered } from './memo'
 const LABEL = { plugin: 'compact-memo', key: 'label' } as const
 const MEMOS = 'memos'
 const COMPACTIONS = 'compactions'
-const KEEP_MEMOS = 5
+const KEEP_MEMOS = 10
 const KEEP_COMPACTIONS = 20
 
 const pad = (n: number) => String(n).padStart(2, '0')
@@ -47,6 +47,8 @@ async function gather($: EngineInterface, at: number): Promise<Gathered> {
   return { ...others, label, at: when(at), branch: await branch($) }
 }
 
+const sessionId = ($: EngineInterface) => $.session.id().catch(() => undefined)
+
 async function keep<T>($: EngineInterface, key: string, item: T, max: number): Promise<void> {
   const list = ((await $.store.get(key)) ?? []) as T[]
   await $.store.set(key, [...list, item].slice(-max))
@@ -62,13 +64,26 @@ export function recordLine(c: CompactionRecord): string {
   return `${when(c.at)} ${TRIGGER_WORD[c.trigger] ?? c.trigger}${where}: ${fill}${size}${memo}`
 }
 
-export function report(memos: MemoRecord[], compactions: CompactionRecord[]): string {
-  const lines: string[] = []
-  const last = memos.at(-1)
-  lines.push(last ? `## 最後に作られた退避メモ（${when(last.at)}・${TRIGGER_WORD[last.trigger] ?? last.trigger}）\n\n${last.text}` : 'まだ退避メモはありません。')
+// The session `/compact-memo` is typed in: its id, and its folder for the heading.
+export type Here = { session: string | undefined; label: string }
+
+// This session first: its last compaction and the memo handed back then, or that there was none.
+// Other sessions' memos are theirs to show; their compactions stay in the record, marked apart.
+export function report(memos: MemoRecord[], compactions: CompactionRecord[], here: Here): string {
+  const isHere = (r: { session?: string }) => here.session !== undefined && r.session === here.session
+  const lines = [`## このセッション${here.label ? `（${here.label}）` : ''}`]
+  const last = compactions.filter(isHere).at(-1)
+  const memo = last?.hasMemo ? memos.filter(isHere).find(m => m.at === last.at) : undefined
+  if (!last) lines.push('このセッションではまだ圧縮が起きていません。')
+  else {
+    lines.push(`最後の圧縮: ${recordLine(last)}`)
+    if (memo) lines.push('', '### そのとき渡し直した退避メモ', '', memo.text)
+    else lines.push('この圧縮では退避メモを作っていません。圧縮後の Claude には、要約だけが渡りました。')
+  }
+  if (memos.some(m => !isHere(m))) lines.push('', 'ほかのセッションの退避メモは、そのセッションで /compact-memo を打つと見られます。')
   if (compactions.length > 0) {
-    lines.push('', '## 圧縮の記録（新しい順）')
-    for (const c of [...compactions].reverse()) lines.push(`- ${recordLine(c)}`)
+    lines.push('', '## 圧縮の記録（新しい順・すべてのセッション）')
+    for (const c of [...compactions].reverse()) lines.push(`- ${recordLine(c)}${isHere(c) ? '（このセッション）' : ''}`)
   }
 
   return lines.join('\n')
@@ -79,7 +94,7 @@ export const register: Register = on => {
     const started = await next(e)
     const folder = started.cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? ''
     await $.state.set(LABEL, folder).catch(() => {})
-    await $.command.register({ name: 'compact-memo', description: '直近の圧縮前の退避メモと、圧縮の記録を見る' })
+    await $.command.register({ name: 'compact-memo', description: 'このセッションの最後の圧縮と退避メモ、圧縮の記録を見る' })
 
     return started
   })
@@ -87,8 +102,9 @@ export const register: Register = on => {
   on('command.run', { command: 'compact-memo' }, async $ => {
     const memos = ((await $.store.get(MEMOS)) ?? []) as MemoRecord[]
     const compactions = ((await $.store.get(COMPACTIONS)) ?? []) as CompactionRecord[]
+    const here = { session: await sessionId($), label: await $.state.get(LABEL).then(r => r.value ?? '', () => '') }
 
-    return { text: report(memos, compactions) }
+    return { text: report(memos, compactions, here) }
   })
 
   // A failure here never stands in the way of the compaction: the hook is skipped and it goes ahead.
@@ -108,6 +124,7 @@ export const register: Register = on => {
     const text = gathered ? buildMemo(gathered) : undefined
     const label = gathered?.label ?? (await $.state.get(LABEL).then(r => r.value ?? '', () => ''))
     const reason: CompactionRecord['reason'] = !gathered ? 'unread' : text === undefined ? 'empty' : undefined
+    const session = await sessionId($)
     const record: CompactionRecord = {
       at,
       trigger: e.trigger,
@@ -117,6 +134,7 @@ export const register: Register = on => {
       label,
       hasMemo: text !== undefined,
       ...(reason ? { reason } : {}),
+      ...(session ? { session } : {}),
     }
     await keep($, COMPACTIONS, record, KEEP_COMPACTIONS).catch(() => {})
     // Said either way: no memo is the summary standing alone, not a failure to look for.
@@ -125,7 +143,7 @@ export const register: Register = on => {
 
       return done
     }
-    await keep<MemoRecord>($, MEMOS, { at, trigger: e.trigger, text }, KEEP_MEMOS).catch(() => {})
+    await keep<MemoRecord>($, MEMOS, { at, trigger: e.trigger, text, ...(session ? { session } : {}) }, KEEP_MEMOS).catch(() => {})
     $.ui.toast('圧縮前のメモを渡し直しました（/compact-memo で見られます）', { timeoutMs: 8000 })
 
     return { ...done, messages: [...done.messages, { role: 'user' as const, text, toolUses: [] }] }

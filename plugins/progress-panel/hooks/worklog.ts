@@ -101,6 +101,30 @@ export function parseCommit(stdout: string): { hash: string; subject: string } |
 
 export const isCommit = (command: string) => /\bgit\b[^|;&]*\bcommit\b/.test(command)
 
+const unquote = (word: string) => word.replace(/^(["'])(.*)\1$/, '$2')
+// Git Bash spells C:\x as /c/x, which git for Windows does not read back.
+const native = (dir: string) => dir.replace(/^\/([a-zA-Z])(?=\/|$)/, (_, drive: string) => `${drive.toUpperCase()}:`)
+
+// Where a commit ran, read from its command: `git -C <dir>`, or else the last `cd` before it
+// (`Set-Location`, `pushd` too). Undefined for the shell's own directory.
+export function commitDir(command: string): string | undefined {
+  const at = /\bgit\b[^|;&]*\bcommit\b/.exec(command)
+  if (!at) return undefined
+  const dashC = /\bgit\s+(?:\S+\s+)*?-C\s+("[^"]*"|'[^']*'|\S+)/.exec(at[0])
+  if (dashC?.[1]) return native(unquote(dashC[1]))
+  const moves = [...command.slice(0, at.index).matchAll(/(?:^|[;&|]\s*)(?:cd|Set-Location|pushd|Push-Location)\s+(?:\/d\s+)?("[^"]*"|'[^']*'|[^\s;&|]+)/gi)]
+  const last = moves.at(-1)?.[1]
+
+  return last ? native(unquote(last)) : undefined
+}
+
+// `git log -1 --format=%h%x09%ct%x09%s`: the hash, the commit time (ms) and the subject.
+export function parseHead(stdout: string): { hash: string; at: number; subject: string } | undefined {
+  const m = /^([0-9a-f]{7,40})\t(\d+)\t(.*)$/m.exec(stdout)
+
+  return m?.[1] && m[2] && m[3] !== undefined ? { hash: m[1], at: Number(m[2]) * 1000, subject: m[3].trim() } : undefined
+}
+
 type Ran = { isError?: boolean; result?: unknown; text?: string }
 
 // An interrupted call comes back as an error whose result is only its text, never the tool's record:

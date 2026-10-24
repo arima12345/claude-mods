@@ -51,12 +51,14 @@ import {
   agentStarted,
   agentsForNewTurn,
   classify,
+  commitDir,
   entryLine,
   isBreak,
   isCommit,
   maskCommand,
   outcomeOf,
   parseCommit,
+  parseHead,
   running,
   worklogMarkdown,
 } from './worklog'
@@ -380,10 +382,27 @@ async function noteLog($: EngineInterface, e: Call, ran: Ran): Promise<void> {
     const kind = classify(input.command)
     if (kind) entries.push({ kind, t, command: maskCommand(input.command), outcome: outcomeOf(ran), agent })
     const stdout = typeof ran.result === 'object' && ran.result !== null ? (ran.result as { stdout?: unknown }).stdout : undefined
-    const commit = !ran.isError && isCommit(input.command) && typeof stdout === 'string' ? parseCommit(stdout) : undefined
+    const isCommitted = !ran.isError && isCommit(input.command)
+    const commit = isCommitted ? ((typeof stdout === 'string' ? parseCommit(stdout) : undefined) ?? (await readHead($, input.command, t))) : undefined
     if (commit) entries.push({ kind: 'commit', t, ...commit, agent })
   }
   if (entries.length > 0) await update($, log, l => entries.reduce(addEntry, l))
+}
+
+// How recent a commit read from HEAD must be to count as the one just made (hooks before a commit can be slow).
+const FRESH_COMMIT_MS = 10 * 60_000
+
+// A quiet commit (`-q`) prints nothing to read: ask git for HEAD where it ran, and take it only
+// when it was made just now and is not logged yet (a command that went on after a failed commit).
+async function readHead($: EngineInterface, command: string, t: number): Promise<{ hash: string; subject: string } | undefined> {
+  const dir = commitDir(command)
+  const argv = ['git', ...(dir ? ['-C', dir] : []), 'log', '-1', '--format=%h%x09%ct%x09%s']
+  const ran = await $.process.run(argv, { timeoutMs: 3000 }).catch(() => undefined)
+  const head = ran && ran.exitCode === 0 ? parseHead(ran.stdout) : undefined
+  if (!head || head.at < t - FRESH_COMMIT_MS) return undefined
+  if ((await read($, log)).some(e => e.kind === 'commit' && e.hash === head.hash)) return undefined
+
+  return { hash: head.hash, subject: head.subject }
 }
 
 type Measured = Pick<SessionMeasureInput, 'context' | 'rateLimits'>

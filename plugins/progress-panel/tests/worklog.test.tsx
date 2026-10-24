@@ -1,7 +1,7 @@
 import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
-import { addEntry, classify, maskCommand, parseCommit, worklogMarkdown } from '../hooks/worklog'
+import { addEntry, classify, commitDir, maskCommand, parseCommit, parseHead, worklogMarkdown } from '../hooks/worklog'
 
 const PANE = { component: 'Pane', requestId: 'progress-panel', props: { title: 'Claudeの進捗', isFocused: false, bodyColumns: 40, placement: 'dock', scroll: { offset: 0, bodyRows: 20 }, view: {} } } as const
 
@@ -180,4 +180,48 @@ test('only consecutive edits of one file are folded', () => {
   const log = [edit('a'), edit('a'), edit('b'), edit('a'), edit('a', 'worker')].reduce(addEntry, [] as Parameters<typeof addEntry>[0])
   expect(log.map(e => (e.kind === 'edit' ? `${e.path}${e.count}${e.agent ?? ''}` : ''))).toEqual(['a2', 'b1', 'a1', 'a1worker'])
   expect(worklogMarkdown(log)).toContain('### 変更したファイル\n- a\n- b')
+})
+
+test('a quiet commit is read from HEAD where it ran, once, and only when just made', async ($, on) => {
+  world(on)
+  const now = at(15, 0)
+  const heads: Record<string, string> = {
+    'C:/ARIMA/wt/x': `9f8e7d6\t${now / 1000 - 30}\tQuiet commit`,
+    here: `5a5a5a5\t${now / 1000 - 3600}\tAn old commit`,
+  }
+  const asked: (readonly string[])[] = []
+  on('process.run', async (_$, e) => {
+    asked.push(e.argv)
+    const dir = e.argv[1] === '-C' ? (e.argv[2] ?? '') : 'here'
+
+    return { value: { exitCode: 0, stdout: `${heads[dir] ?? ''}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } as never
+  })
+  on('tool.call', async () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: 'ok' }) as never)
+
+  await $.turn.start({ text: '直して', turnId: 't1' })
+  await $.tool.call({ tool: 'Bash', command: "cd /c/ARIMA/wt/x && git add -A && git commit -q -F - <<'EOF2'" } as never)
+  // The same HEAD again (a commit that did nothing but exited 0) is not a second commit.
+  await $.tool.call({ tool: 'Bash', command: 'git -C C:/ARIMA/wt/x commit -q -m again' } as never)
+  // An hour-old HEAD was not made by this command.
+  await $.tool.call({ tool: 'Bash', command: 'git commit -q -m "nothing"; echo done' } as never)
+
+  expect(asked.filter(a => a.includes('log'))).toEqual([
+    ['git', '-C', 'C:/ARIMA/wt/x', 'log', '-1', '--format=%h%x09%ct%x09%s'],
+    ['git', '-C', 'C:/ARIMA/wt/x', 'log', '-1', '--format=%h%x09%ct%x09%s'],
+    ['git', 'log', '-1', '--format=%h%x09%ct%x09%s'],
+  ])
+  const text = ((await $.command.run({ command: 'worklog', args: '' } as never)) as { text?: string }).text ?? ''
+  expect(text).toContain('### コミット\n- 9f8e7d6 Quiet commit')
+  expect(text).not.toContain('5a5a5a5')
+})
+
+test('where a commit ran is read from git -C or the last cd before it', () => {
+  expect(commitDir('git commit -q -m x')).toBeUndefined()
+  expect(commitDir('cd /c/ARIMA/wt/a && git commit -q -m x')).toBe('C:/ARIMA/wt/a')
+  expect(commitDir('cd a; cd "C:/b c" && git add -A && git commit -q')).toBe('C:/b c')
+  expect(commitDir('git -c user.name=x -C ../repo commit -q')).toBe('../repo')
+  expect(commitDir("Set-Location 'C:\ARIMA\wt\a'; git commit -q -m x")).toBe('C:\ARIMA\wt\a')
+  expect(commitDir('git status')).toBeUndefined()
+  expect(parseHead('abc1234\t1729000000\tFix it\n')).toEqual({ hash: 'abc1234', at: 1729000000000, subject: 'Fix it' })
+  expect(parseHead('fatal: not a git repository')).toBeUndefined()
 })
