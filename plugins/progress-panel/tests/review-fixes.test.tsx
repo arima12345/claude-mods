@@ -117,7 +117,7 @@ test('a break whose fill arrives only after the turn ends is still noticed', asy
   await $.turn.complete(done('t1'))
   expect(w.breaks()).toEqual([])
   await $.session.measure(fill(106_000))
-  expect(w.breaks()).toEqual(['区切りどきです（文脈 53%）。続ける前に /compact か /clear を検討してください。'])
+  expect(w.breaks()).toEqual(['区切りどきです（文脈 53%）。/handoff で引き継ぎメモを作り、新しい会話へ移るのがおすすめです。'])
   // Said once: a later reading of the same idle moment does not repeat it.
   await $.session.measure(fill(107_000))
   expect(w.breaks()).toHaveLength(1)
