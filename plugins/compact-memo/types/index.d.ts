@@ -10,6 +10,8 @@ export type LogSlice = { kind: string; t: number; path?: string; command?: strin
 
 declare module 'claude-code' {
   interface PluginState {
+    // The name of the folder the session opened, for the memo's heading.
+    'compact-memo': { label: string }
     goal2: { goal: GoalSlice }
     'progress-panel': { progress: { tasks: TaskSlice[] }; log: LogSlice[] }
   }

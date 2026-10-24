@@ -1,12 +1,20 @@
-import type { EngineInterface, Register, SessionCompactInput } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 
 import type { CompactionRecord, GoalSlice, LogSlice, MemoRecord, TaskSlice } from '../types'
-import { buildMemo, parseGitStatus, recentRequests, withInstruction, type Gathered } from './memo'
+import { buildMemo, withInstruction, type Gathered } from './memo'
 
+const LABEL = { plugin: 'compact-memo', key: 'label' } as const
 const MEMOS = 'memos'
 const COMPACTIONS = 'compactions'
 const KEEP_MEMOS = 5
 const KEEP_COMPACTIONS = 20
+
+const pad = (n: number) => String(n).padStart(2, '0')
+function when(ms: number): string {
+  const d = new Date(ms)
+
+  return `${d.getMonth() + 1}/${d.getDate()} ${d.getHours()}:${pad(d.getMinutes())}`
+}
 
 const TRIGGER_WORD: Record<string, string> = { manual: '手動', auto: '自動', plugin: 'mod', precompute: '事前' }
 
@@ -19,29 +27,24 @@ async function readOthers($: EngineInterface): Promise<{ goal: GoalSlice; tasks:
   return { goal, tasks: progress?.tasks ?? [], log }
 }
 
-// `undefined` when git cannot say (no repository, no git): the work log stands in.
-async function gitStatus($: EngineInterface): Promise<string[] | undefined> {
-  const run = await $.process.run(['git', 'status', '--short'], { timeoutMs: 5000 }).catch(() => undefined)
+// `undefined` where git cannot say (no repository, no git, a detached head).
+async function branch($: EngineInterface): Promise<string | undefined> {
+  const run = await $.process.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], { timeoutMs: 5000 }).catch(() => undefined)
+  const name = run && run.exitCode === 0 ? run.stdout.trim() : ''
 
-  return run && run.exitCode === 0 ? parseGitStatus(run.stdout) : undefined
+  return name && name !== 'HEAD' ? name : undefined
 }
 
-async function gather($: EngineInterface, e: SessionCompactInput): Promise<Gathered> {
+async function gather($: EngineInterface, at: number): Promise<Gathered> {
   const others = await readOthers($)
+  const label = await $.state.get(LABEL).then(r => r.value ?? '', () => '')
 
-  return { ...others, requests: recentRequests(e.messages), gitStatus: await gitStatus($) }
+  return { ...others, label, at: when(at), branch: await branch($) }
 }
 
 async function keep<T>($: EngineInterface, key: string, item: T, max: number): Promise<void> {
   const list = ((await $.store.get(key)) ?? []) as T[]
   await $.store.set(key, [...list, item].slice(-max))
-}
-
-const pad = (n: number) => String(n).padStart(2, '0')
-function when(ms: number): string {
-  const d = new Date(ms)
-
-  return `${d.getMonth() + 1}/${d.getDate()} ${d.getHours()}:${pad(d.getMinutes())}`
 }
 
 export function report(memos: MemoRecord[], compactions: CompactionRecord[]): string {
@@ -62,9 +65,12 @@ export function report(memos: MemoRecord[], compactions: CompactionRecord[]): st
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    const started = await next(e)
+    const folder = started.cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? ''
+    await $.state.set(LABEL, folder).catch(() => {})
     await $.command.register({ name: 'compact-memo', description: '直近の圧縮前の退避メモと、圧縮の記録を見る' })
 
-    return next(e)
+    return started
   })
 
   on('command.run', { command: 'compact-memo' }, async $ => {
@@ -79,9 +85,9 @@ export const register: Register = on => {
     // A subagent's own transcript is its business.
     if (e.agentId) return next(e)
     const isFinal = e.trigger !== 'precompute'
-    // Gathered before the summary runs, so the memo holds the moment it replaces.
-    const gathered = isFinal ? await gather($, e).catch(() => undefined) : undefined
     const at = await $.clock.now()
+    // Gathered before the summary runs, so the memo holds the moment it replaces.
+    const gathered = isFinal ? await gather($, at).catch(() => undefined) : undefined
     if (isFinal) {
       const { context } = await $.session.usage().catch(() => ({ context: undefined }))
       const record: CompactionRecord = { at, trigger: e.trigger, percent: context?.percent, tokens: context?.tokens, window: context?.window ?? 0 }
@@ -92,6 +98,8 @@ export const register: Register = on => {
     if (!isFinal || !gathered || !done.messages) return done
 
     const text = buildMemo(gathered)
+    // Nothing worth handing back: the summary stands alone, and nothing is said.
+    if (text === undefined) return done
     await keep<MemoRecord>($, MEMOS, { at, trigger: e.trigger, text }, KEEP_MEMOS).catch(() => {})
     $.ui.toast('圧縮前のメモを渡し直しました（/compact-memo で見られます）', { timeoutMs: 8000 })
 
