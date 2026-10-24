@@ -1,7 +1,18 @@
 // A memo handed back after one compaction.
 export type MemoRecord = { at: number; trigger: string; text: string }
 // One compaction as it happened, to learn where automatic compaction really starts.
-export type CompactionRecord = { at: number; trigger: string; percent?: number; tokens?: number; window: number }
+export type CompactionRecord = {
+  at: number
+  trigger: string
+  percent?: number
+  tokens?: number
+  window: number
+  // The session's folder, and whether a memo came of it (absent on records before 0.3).
+  label?: string
+  hasMemo?: boolean
+  // Why no memo: nothing worth keeping, or the state could not be read.
+  reason?: 'empty' | 'unread'
+}
 
 // The parts of other mods' state this one reads, when they are installed. It never writes them.
 export type GoalSlice = { condition: string; status: string } | null

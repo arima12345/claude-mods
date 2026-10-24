@@ -17,6 +17,11 @@ function when(ms: number): string {
 }
 
 const TRIGGER_WORD: Record<string, string> = { manual: '手動', auto: '自動', plugin: 'mod', precompute: '事前' }
+const NO_MEMO_WHY: Record<NonNullable<CompactionRecord['reason']>, string> = { empty: '残すことがなかった', unread: '状況を読み取れなかった' }
+const NO_MEMO_TOAST: Record<NonNullable<CompactionRecord['reason']>, string> = {
+  empty: '残すことがなかったので、退避メモは作りませんでした（ゴール・やることの残り・コミット・失敗中のテストがありません）',
+  unread: '状況を読み取れなかったので、退避メモは作りませんでした',
+}
 
 // Other mods' state: read when installed, empty when not.
 async function readOthers($: EngineInterface): Promise<{ goal: GoalSlice; tasks: TaskSlice[]; log: LogSlice[] }> {
@@ -47,17 +52,23 @@ async function keep<T>($: EngineInterface, key: string, item: T, max: number): P
   await $.store.set(key, [...list, item].slice(-max))
 }
 
+// One compaction: when, how, where, how full, and whether a memo came of it (older records lack the last two).
+export function recordLine(c: CompactionRecord): string {
+  const fill = c.percent !== undefined ? `文脈 ${c.percent}%` : '文脈 —'
+  const size = c.tokens !== undefined ? `（約 ${Math.round(c.tokens / 1000)}k / ${Math.round(c.window / 1000)}k）` : ''
+  const where = c.label ? `・${c.label}` : ''
+  const memo = c.hasMemo === undefined ? '' : c.hasMemo ? '・メモあり' : `・メモなし（${NO_MEMO_WHY[c.reason ?? 'empty']}）`
+
+  return `${when(c.at)} ${TRIGGER_WORD[c.trigger] ?? c.trigger}${where}: ${fill}${size}${memo}`
+}
+
 export function report(memos: MemoRecord[], compactions: CompactionRecord[]): string {
   const lines: string[] = []
   const last = memos.at(-1)
-  lines.push(last ? `## 直近の退避メモ（${when(last.at)}・${TRIGGER_WORD[last.trigger] ?? last.trigger}）\n\n${last.text}` : 'まだ退避メモはありません（このセッションより前も含めて、圧縮が起きていません）。')
+  lines.push(last ? `## 最後に作られた退避メモ（${when(last.at)}・${TRIGGER_WORD[last.trigger] ?? last.trigger}）\n\n${last.text}` : 'まだ退避メモはありません。')
   if (compactions.length > 0) {
     lines.push('', '## 圧縮の記録（新しい順）')
-    for (const c of [...compactions].reverse()) {
-      const fill = c.percent !== undefined ? `文脈 ${c.percent}%` : '文脈 —'
-      const size = c.tokens !== undefined ? `（約 ${Math.round(c.tokens / 1000)}k / ${Math.round(c.window / 1000)}k）` : ''
-      lines.push(`- ${when(c.at)} ${TRIGGER_WORD[c.trigger] ?? c.trigger}: ${fill}${size}`)
-    }
+    for (const c of [...compactions].reverse()) lines.push(`- ${recordLine(c)}`)
   }
 
   return lines.join('\n')
@@ -88,18 +99,32 @@ export const register: Register = on => {
     const at = await $.clock.now()
     // Gathered before the summary runs, so the memo holds the moment it replaces.
     const gathered = isFinal ? await gather($, at).catch(() => undefined) : undefined
-    if (isFinal) {
-      const { context } = await $.session.usage().catch(() => ({ context: undefined }))
-      const record: CompactionRecord = { at, trigger: e.trigger, percent: context?.percent, tokens: context?.tokens, window: context?.window ?? 0 }
-      await keep($, COMPACTIONS, record, KEEP_COMPACTIONS).catch(() => {})
-    }
+    const context = isFinal ? (await $.session.usage().catch(() => undefined))?.context : undefined
 
     const done = await next({ ...e, instructions: withInstruction(e.instructions) })
-    if (!isFinal || !gathered || !done.messages) return done
+    // A compaction that did not happen (a skip) leaves no record.
+    if (!isFinal || !done.messages) return done
 
-    const text = buildMemo(gathered)
-    // Nothing worth handing back: the summary stands alone, and nothing is said.
-    if (text === undefined) return done
+    const text = gathered ? buildMemo(gathered) : undefined
+    const label = gathered?.label ?? (await $.state.get(LABEL).then(r => r.value ?? '', () => ''))
+    const reason: CompactionRecord['reason'] = !gathered ? 'unread' : text === undefined ? 'empty' : undefined
+    const record: CompactionRecord = {
+      at,
+      trigger: e.trigger,
+      percent: context?.percent,
+      tokens: context?.tokens,
+      window: context?.window ?? 0,
+      label,
+      hasMemo: text !== undefined,
+      ...(reason ? { reason } : {}),
+    }
+    await keep($, COMPACTIONS, record, KEEP_COMPACTIONS).catch(() => {})
+    // Said either way: no memo is the summary standing alone, not a failure to look for.
+    if (text === undefined) {
+      $.ui.toast(NO_MEMO_TOAST[reason ?? 'empty'], { timeoutMs: 8000 })
+
+      return done
+    }
     await keep<MemoRecord>($, MEMOS, { at, trigger: e.trigger, text }, KEEP_MEMOS).catch(() => {})
     $.ui.toast('圧縮前のメモを渡し直しました（/compact-memo で見られます）', { timeoutMs: 8000 })
 
