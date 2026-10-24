@@ -1,1 +1,1 @@
-{ "name": "compact-memo", "version": "0.2.0", "description": "会話の圧縮で決定事項が抜けないよう要約に指示し、ゴール・やることの残り・ブランチ・コミットをメモにして圧縮後の Claude へ渡し直す", "author": { "name": "arima12345" }, "types": "./types/index.d.ts" }
+{ "name": "compact-memo", "version": "0.3.0", "description": "会話の圧縮で決定事項が抜けないよう要約に指示し、ゴール・やることの残り・ブランチ・コミットをメモにして圧縮後の Claude へ渡し直す", "author": { "name": "arima12345" }, "types": "./types/index.d.ts" }

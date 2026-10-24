@@ -2,6 +2,7 @@ import type { On, SessionCompactInput, SessionMessage } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
 import { buildMemo, isLastCheckFailing, SUMMARY_INSTRUCTION, withInstruction, type Gathered } from '../hooks/memo'
+import { recordLine } from '../hooks/register'
 
 const msg = (role: 'user' | 'assistant', text: string): SessionMessage => ({ role, text, toolUses: [] })
 
@@ -20,7 +21,7 @@ const TASKS = [
   { id: '2', title: 'テストする', status: 'pending' },
 ]
 
-type Others = { goal?: unknown; tasks?: unknown[]; log?: unknown[] }
+type Others = { goal?: unknown; tasks?: unknown[]; log?: unknown[]; isSkipped?: boolean }
 
 function world(on: On, others: Others = {}, branch: string | 'none' = 'fix-compact-memo-trim'): World {
   mock.clock(on, { now: new Date(2026, 9, 24, 21, 5).getTime() })
@@ -35,7 +36,7 @@ function world(on: On, others: Others = {}, branch: string | 'none' = 'fix-compa
   on('session.compact', async (_$, e) => {
     w.seen.push(e)
 
-    return { messages: [SUMMARY] }
+    return others.isSkipped ? { skip: '別の mod が止めた' } : { messages: [SUMMARY] }
   })
   on('session.usage', async () => ({ value: { startedAt: 0, context: { percent: 96, tokens: 960_000, window: 1_000_000 }, rateLimits: [] } }) as never)
   on('process.run', async (_$, e) =>
@@ -101,8 +102,8 @@ test('the memo holds the goal, the tasks left, the branch, commits and a failing
   expect(w.toasts).toEqual(['圧縮前のメモを渡し直しました（/compact-memo で見られます）'])
 
   const report = ((await $.command.run({ command: 'compact-memo', args: '' } as never)) as { text?: string }).text ?? ''
-  expect(report).toContain('## 直近の退避メモ（10/24 21:05・自動）')
-  expect(report).toContain('## 圧縮の記録（新しい順）\n- 10/24 21:05 自動: 文脈 96%（約 960k / 1000k）')
+  expect(report).toContain('## 最後に作られた退避メモ（10/24 21:05・自動）')
+  expect(report).toContain('## 圧縮の記録（新しい順）\n- 10/24 21:05 自動・claude-mods: 文脈 96%（約 960k / 1000k）・メモあり')
 })
 
 test('requests, earlier memos, git status and failed commands are not copied', async ($, on) => {
@@ -115,15 +116,29 @@ test('requests, earlier memos, git status and failed commands are not copied', a
   expect(memo).toContain('## やることリストの残り')
 })
 
-test('with nothing worth keeping, no memo and no toast', async ($, on) => {
+test('with nothing worth keeping, no memo, but a toast and a record that say so', async ($, on) => {
   const w = world(on, { tasks: [{ id: '0', title: '終わった', status: 'completed' }], log: [{ kind: 'edit', t: 1, path: '/r/a.ts' }] })
+  await $.session.start(start)
   const out = (await $.session.compact({ trigger: 'auto', messages: CONVERSATION } as never)) as { messages: SessionMessage[] }
   expect(out.messages).toEqual([SUMMARY])
-  expect(w.toasts).toEqual([])
-  // The compaction is still on the record.
+  expect(w.toasts).toEqual(['残すことがなかったので、退避メモは作りませんでした（ゴール・やることの残り・コミット・失敗中のテストがありません）'])
   const report = ((await $.command.run({ command: 'compact-memo', args: '' } as never)) as { text?: string }).text ?? ''
-  expect(report).toContain('まだ退避メモはありません')
-  expect(report).toContain('自動: 文脈 96%')
+  expect(report).toContain('まだ退避メモはありません。')
+  expect(report).toContain('- 10/24 21:05 自動・claude-mods: 文脈 96%（約 960k / 1000k）・メモなし（残すことがなかった）')
+})
+
+test('a skipped compaction leaves no record', async ($, on) => {
+  const w = world(on, { goal: GOAL, isSkipped: true })
+  await $.session.compact({ trigger: 'manual', messages: CONVERSATION } as never)
+  const report = ((await $.command.run({ command: 'compact-memo', args: '' } as never)) as { text?: string }).text ?? ''
+  expect(report).not.toContain('圧縮の記録')
+  expect(w.toasts).toEqual([])
+})
+
+test('records from before 0.3 read without folder or memo, and an unread state is said', () => {
+  const at = new Date(2026, 9, 24, 23, 46).getTime()
+  expect(recordLine({ at, trigger: 'manual', percent: 85, tokens: 849_000, window: 1_000_000 })).toBe('10/24 23:46 手動: 文脈 85%（約 849k / 1000k）')
+  expect(recordLine({ at, trigger: 'auto', window: 0, label: 'Note記事執筆', hasMemo: false, reason: 'unread' })).toBe('10/24 23:46 自動・Note記事執筆: 文脈 —・メモなし（状況を読み取れなかった）')
 })
 
 test('without git the branch is left out', async ($, on) => {
