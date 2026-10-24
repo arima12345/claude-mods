@@ -2,7 +2,7 @@ import type { On, SessionCompactInput, SessionMessage } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
 import { buildMemo, isLastCheckFailing, SUMMARY_INSTRUCTION, withInstruction, type Gathered } from '../hooks/memo'
-import { recordLine } from '../hooks/register'
+import { recordLine, report } from '../hooks/register'
 
 const msg = (role: 'user' | 'assistant', text: string): SessionMessage => ({ role, text, toolUses: [] })
 
@@ -33,6 +33,7 @@ function world(on: On, others: Others = {}, branch: string | 'none' = 'fix-compa
     return { value: undefined } as never
   })
   on('session.start', async (_$, e) => ({ cwd: e.cwd }))
+  on('session.id', async () => ({ value: 'S1' }) as never)
   on('session.compact', async (_$, e) => {
     w.seen.push(e)
 
@@ -102,8 +103,9 @@ test('the memo holds the goal, the tasks left, the branch, commits and a failing
   expect(w.toasts).toEqual(['圧縮前のメモを渡し直しました（/compact-memo で見られます）'])
 
   const report = ((await $.command.run({ command: 'compact-memo', args: '' } as never)) as { text?: string }).text ?? ''
-  expect(report).toContain('## 最後に作られた退避メモ（10/24 21:05・自動）')
-  expect(report).toContain('## 圧縮の記録（新しい順）\n- 10/24 21:05 自動・claude-mods: 文脈 96%（約 960k / 1000k）・メモあり')
+  expect(report).toContain('## このセッション（claude-mods）\n最後の圧縮: 10/24 21:05 自動・claude-mods: 文脈 96%（約 960k / 1000k）・メモあり')
+  expect(report).toContain('### そのとき渡し直した退避メモ\n\n【圧縮前の退避メモ')
+  expect(report).toContain('## 圧縮の記録（新しい順・すべてのセッション）\n- 10/24 21:05 自動・claude-mods: 文脈 96%（約 960k / 1000k）・メモあり（このセッション）')
 })
 
 test('requests, earlier memos, git status and failed commands are not copied', async ($, on) => {
@@ -123,8 +125,8 @@ test('with nothing worth keeping, no memo, but a toast and a record that say so'
   expect(out.messages).toEqual([SUMMARY])
   expect(w.toasts).toEqual(['残すことがなかったので、退避メモは作りませんでした（ゴール・やることの残り・コミット・失敗中のテストがありません）'])
   const report = ((await $.command.run({ command: 'compact-memo', args: '' } as never)) as { text?: string }).text ?? ''
-  expect(report).toContain('まだ退避メモはありません。')
-  expect(report).toContain('- 10/24 21:05 自動・claude-mods: 文脈 96%（約 960k / 1000k）・メモなし（残すことがなかった）')
+  expect(report).toContain('この圧縮では退避メモを作っていません。圧縮後の Claude には、要約だけが渡りました。')
+  expect(report).toContain('- 10/24 21:05 自動・claude-mods: 文脈 96%（約 960k / 1000k）・メモなし（残すことがなかった）（このセッション）')
 })
 
 test('a skipped compaction leaves no record', async ($, on) => {
@@ -173,7 +175,28 @@ test('a precomputed summary gets the instruction but no memo, and a subagent com
 test('/compact-memo says so before any compaction', async ($, on) => {
   world(on)
   const report = ((await $.command.run({ command: 'compact-memo', args: '' } as never)) as { text?: string }).text ?? ''
-  expect(report).toContain('まだ退避メモはありません')
+  expect(report).toContain('## このセッション\nこのセッションではまだ圧縮が起きていません。')
+})
+
+test("another session's memo is not shown as this one's, and its compactions are marked apart", () => {
+  const at = (h: number, m: number) => new Date(2026, 9, 24, h, m).getTime()
+  const memos = [{ at: at(23, 40), trigger: 'manual', text: '【Note記事執筆のメモ】', session: 'NOTE' }, { at: at(23, 0), trigger: 'auto', text: '【0.4 より前のメモ】' }]
+  const compactions = [
+    { at: at(23, 0), trigger: 'auto', percent: 92, tokens: 924_000, window: 1_000_000 },
+    { at: at(23, 40), trigger: 'manual', percent: 39, tokens: 395_000, window: 1_000_000, label: 'Note記事執筆', hasMemo: true, session: 'NOTE' },
+    { at: at(23, 52), trigger: 'manual', percent: 66, tokens: 663_000, window: 1_000_000, label: 'Codex環境について', hasMemo: false, reason: 'empty' as const, session: 'HERE' },
+  ]
+  const text = report(memos, compactions, { session: 'HERE', label: 'Codex環境について' })
+  expect(text).toContain('## このセッション（Codex環境について）\n最後の圧縮: 10/24 23:52 手動・Codex環境について: 文脈 66%（約 663k / 1000k）・メモなし（残すことがなかった）\nこの圧縮では退避メモを作っていません。')
+  expect(text).not.toContain('Note記事執筆のメモ')
+  expect(text).not.toContain('0.4 より前のメモ')
+  expect(text).toContain('ほかのセッションの退避メモは、そのセッションで /compact-memo を打つと見られます。')
+  expect(text).toContain('- 10/24 23:52 手動・Codex環境について: 文脈 66%（約 663k / 1000k）・メモなし（残すことがなかった）（このセッション）\n- 10/24 23:40 手動・Note記事執筆: 文脈 39%（約 395k / 1000k）・メモあり\n- 10/24 23:00 自動: 文脈 92%')
+
+  // In the session that made it, the memo is shown.
+  expect(report(memos, compactions, { session: 'NOTE', label: 'Note記事執筆' })).toContain('### そのとき渡し直した退避メモ\n\n【Note記事執筆のメモ】')
+  // A session id that cannot be read claims nothing as its own.
+  expect(report(memos, compactions, { session: undefined, label: '' })).not.toContain('（このセッション）')
 })
 
 test('only the very last test or check counts', () => {
