@@ -71,7 +71,7 @@ test('a break in the work past 50% is a good moment, said again only ten points 
   await $.tool.call({ tool: 'TodoWrite', todos: [{ content: '作る', status: 'completed', activeForm: '作っている' }] })
   await $.session.measure(fill(110_000))
   await $.turn.complete(done('t1'))
-  expect(w.breaks()).toEqual(['区切りどきです（文脈 55%）。続ける前に /compact か /clear を検討してください。'])
+  expect(w.breaks()).toEqual(['区切りどきです（文脈 55%）。/handoff で引き継ぎメモを作り、新しい会話へ移るのがおすすめです。'])
 
   // A commit at 58% is a break, but too close to the last notice.
   await $.turn.start({ text: 'コミットして', turnId: 't2' })
@@ -84,7 +84,7 @@ test('a break in the work past 50% is a good moment, said again only ten points 
   await $.tool.call({ tool: 'Bash', command: 'git commit -m "More"' } as never)
   await $.session.measure(fill(132_000))
   await $.turn.complete(done('t3'))
-  expect(w.breaks().at(-1)).toBe('区切りどきです（文脈 66%）。続ける前に /compact か /clear を検討してください。')
+  expect(w.breaks().at(-1)).toBe('区切りどきです（文脈 66%）。/handoff で引き継ぎメモを作り、新しい会話へ移るのがおすすめです。')
 })
 
 test('mid-work past 50% stays quiet, and a /compact arms the notice again', async ($, on) => {
@@ -106,7 +106,7 @@ test('mid-work past 50% stays quiet, and a /compact arms the notice again', asyn
   await $.tool.call({ tool: 'Bash', command: 'git commit -m "x"' } as never)
   await $.session.measure(fill(104_000))
   await $.turn.complete(done('t3'))
-  expect(w.breaks().at(-1)).toBe('区切りどきです（文脈 52%）。続ける前に /compact か /clear を検討してください。')
+  expect(w.breaks().at(-1)).toBe('区切りどきです（文脈 52%）。/handoff で引き継ぎメモを作り、新しい会話へ移るのがおすすめです。')
 })
 
 test('a break is a done list, a commit, or a failing check that now passes', () => {

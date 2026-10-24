@@ -324,7 +324,7 @@ export function breakStep(pct: number | undefined, isBreak: boolean, notified: n
 }
 
 export function breakToast(pct: number): string {
-  return `区切りどきです（文脈 ${pct}%）。続ける前に /compact か /clear を検討してください。`
+  return `区切りどきです（文脈 ${pct}%）。/handoff で引き継ぎメモを作り、新しい会話へ移るのがおすすめです。`
 }
 
 // What was announced for a window, kept across sessions so each is said once.
