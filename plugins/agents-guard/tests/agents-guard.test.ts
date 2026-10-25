@@ -155,7 +155,7 @@ test('editing the root CLAUDE.md beyond the import asks the model to move it', a
   expect(ran.context?.at(-1)).toContain('CLAUDE.md は `@AGENTS.md` の1行だけにする決まりです')
 })
 
-test('failed edits and other files do nothing; a subagent hears it but the person does not get a toast', async ($, on) => {
+test('failed edits and other files do nothing; a subagent hears it but the person gets no toast mid-turn', async ($, on) => {
   const w = world(on)
   w.write(AGENTS, lines(120, 'old'))
   await $.session.start(start)
@@ -197,4 +197,57 @@ test('the limits follow the settings, and the CLAUDE.md check can be turned off'
   await $.session.start(start)
   expect(w.toasts).toHaveLength(1)
   expect(w.toasts[0]).toMatch(/（25行・[\d,]+字／目安 20行・100,000字）/)
+})
+
+test("a subagent's edit reaches the person at the main turn's end, once", async ($, on) => {
+  const w = world(on)
+  w.write(AGENTS, lines(50))
+  await $.session.start(start)
+  await $.turn.start({ text: '進めて', turnId: 't1' })
+  // Two growing edits by subagents, one in a folder below: each file is told once, with its latest size.
+  await $.tool.call(edit(AGENTS, lines(120), { agentId: 'a1' }))
+  await $.tool.call(edit(AGENTS, lines(130), { agentId: 'a1' }))
+  await $.tool.call(edit(`${ROOT}/ゲーム開発/AGENTS.md`, lines(110), { agentId: 'a2' }))
+  // A subagent's own turn ending is not the main turn's.
+  await $.turn.complete({ ...(done('s1') as object), agentId: 'a1' } as never)
+  expect(w.toasts).toEqual([])
+
+  await $.turn.complete(done('t1'))
+  expect(w.toasts).toHaveLength(2)
+  expect(w.toasts[0]).toMatch(/^AGENTS\.md が目安を超えています（130行/)
+  expect(w.toasts[1]).toMatch(/^AGENTS\.md（ゲーム開発\/） が目安を超えています（110行/)
+
+  // Told once: the next turn's end says nothing more.
+  await $.turn.start({ text: '続けて', turnId: 't2' })
+  await $.turn.complete(done('t2'))
+  expect(w.toasts).toHaveLength(2)
+})
+
+test("the main loop's own toast stands in for a subagent's that waits on the same file", async ($, on) => {
+  const w = world(on)
+  await $.session.start(start)
+  await $.turn.start({ text: '進めて', turnId: 't1' })
+  await $.tool.call(edit(AGENTS, lines(120), { agentId: 'a1' }))
+  await $.tool.call(edit(AGENTS, lines(140)))
+  expect(w.toasts).toHaveLength(1)
+  await $.turn.complete(done('t1'))
+  expect(w.toasts).toHaveLength(1)
+  expect(w.toasts[0]).toMatch(/（140行/)
+})
+
+test('a file that disappears is forgotten, so made again over the limit it is told again', async ($, on) => {
+  const w = world(on)
+  w.write(AGENTS, lines(120))
+  await $.session.start(start)
+  expect(w.toasts).toHaveLength(1)
+
+  // Another branch checked out without AGENTS.md, then one with a shorter (but still long) one.
+  w.files.delete(native(AGENTS))
+  await $.turn.start({ text: 'a', turnId: 't1' })
+  await $.turn.complete(done('t1'))
+  w.write(AGENTS, lines(110))
+  await $.turn.start({ text: 'b', turnId: 't2' })
+  await $.turn.complete(done('t2'))
+  expect(w.toasts).toHaveLength(2)
+  expect(w.toasts[1]).toMatch(/（110行/)
 })

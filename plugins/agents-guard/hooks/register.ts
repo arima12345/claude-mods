@@ -19,6 +19,7 @@ import {
 
 const SAID = { plugin: 'agents-guard', key: 'said' } as const
 const MTIMES = { plugin: 'agents-guard', key: 'mtimes' } as const
+const PENDING = { plugin: 'agents-guard', key: 'pending' } as const
 const EDITS = new Set(['Edit', 'Write', 'MultiEdit'])
 const TOAST_MS = 12_000
 
@@ -51,14 +52,19 @@ async function setSaid($: EngineInterface, key: string, size: Size | undefined):
 }
 
 // One file, measured: what to tell the person (a toast) and the model (after an edit), if anything.
-// A missing or unreadable file says nothing; one back under the limit is forgotten.
+// A missing or unreadable file says nothing and, like one back under the limit, is forgotten,
+// so the file made again over the limit (another branch checked out, say) is told again.
 async function look($: EngineInterface, s: Settings, path: string, root: string, why: Why): Promise<{ toast: string; context: string } | undefined> {
   const text = await $.fs.read(path).then(
     t => (typeof t === 'string' ? t : undefined),
     () => undefined,
   )
   const key = pathKey(path)
-  if (text === undefined) return undefined
+  if (text === undefined) {
+    if ((await readSaid($))[key]) await setSaid($, key, undefined)
+
+    return undefined
+  }
   const isClaudeMd = baseName(path).toLowerCase() === 'claude.md'
   const size = measure(text)
   const isBad = isClaudeMd ? hasOwnContent(text) : isOver(size, s)
@@ -116,7 +122,11 @@ export const register: Register = (on, options) => {
     await noteMtime($, path)
     if (!found) return done
     // A subagent's edit is told to the subagent; the person hears of it at the main turn's end.
-    if (!(e as unknown as { agentId?: unknown }).agentId) $.ui.toast(found.toast, { timeoutMs: TOAST_MS })
+    if (e.agentId) await setPending($, pathKey(path), found.toast)
+    else {
+      await setPending($, pathKey(path), undefined)
+      $.ui.toast(found.toast, { timeoutMs: TOAST_MS })
+    }
 
     return { ...done, context: [...(done.context ?? []), found.context] }
   })
@@ -124,7 +134,10 @@ export const register: Register = (on, options) => {
   // Shell commands and scripts rewrite files without an Edit: look again when a root file changed.
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
-    if ((e as unknown as { agentId?: unknown }).agentId) return done
+    if (e.agentId) return done
+    const pending = await readPending($)
+    if (Object.keys(pending).length > 0) await $.state.set(PENDING, {}).catch(() => {})
+    for (const toast of Object.values(pending)) $.ui.toast(toast, { timeoutMs: TOAST_MS })
     const root = await rootOf($).catch(() => undefined)
     if (root === undefined) return done
     for (const path of rootFiles(root, s)) {
@@ -135,6 +148,22 @@ export const register: Register = (on, options) => {
 
     return done
   })
+}
+
+async function readPending($: EngineInterface): Promise<Record<string, string>> {
+  return $.state.get(PENDING).then(
+    r => r.value ?? {},
+    () => ({}),
+  )
+}
+
+// A subagent's latest word per file waits for the main turn's end; the main loop's own toast replaces it.
+async function setPending($: EngineInterface, key: string, toast: string | undefined): Promise<void> {
+  const pending = { ...(await readPending($)) }
+  if (toast === undefined && !(key in pending)) return
+  if (toast === undefined) delete pending[key]
+  else pending[key] = toast
+  await $.state.set(PENDING, pending).catch(() => {})
 }
 
 async function mtimeOf($: EngineInterface, path: string): Promise<number | undefined> {

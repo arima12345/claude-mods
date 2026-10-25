@@ -1,6 +1,6 @@
 {
   "name": "agents-guard",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "AGENTS.md が目安（100行・6,000字）を超えたときと、ルートの CLAUDE.md に @AGENTS.md 以外の中身があるときに、ユーザーと Claude に知らせる",
   "author": { "name": "arima12345" },
   "types": "./types/index.d.ts",
