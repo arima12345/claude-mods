@@ -13,7 +13,7 @@ const native = (path: string) => path.replace(/\//g, '\\')
 // A file of n lines, each of the given text.
 const lines = (n: number, text = '決まり') => Array.from({ length: n }, (_, i) => `- ${text}${i}`).join('\n') + '\n'
 
-type World = { files: Map<string, { text: string; mtime: number }>; toasts: string[]; reads: string[]; write: (path: string, text: string) => void }
+type World = { files: Map<string, { text: string; mtime: number }>; toasts: string[]; reads: string[]; sessionId: string; write: (path: string, text: string) => void }
 
 function world(on: On): World {
   let clock = 1
@@ -21,9 +21,12 @@ function world(on: On): World {
     files: new Map(),
     toasts: [],
     reads: [],
+    sessionId: 's1',
     write: (path, text) => void w.files.set(native(path), { text, mtime: clock++ }),
   }
   on('session.root', async () => ({ value: ROOT }) as never)
+  // A /clear or a resume goes on under a new id.
+  on('session.id', async () => ({ value: w.sessionId }) as never)
   on('session.start', async (_$, e) => ({ cwd: e.cwd }))
   on('fs.read', async (_$, e) => {
     w.reads.push(e.path)
@@ -250,4 +253,58 @@ test('a file that disappears is forgotten, so made again over the limit it is to
   await $.turn.complete(done('t2'))
   expect(w.toasts).toHaveLength(2)
   expect(w.toasts[1]).toMatch(/（110行/)
+})
+
+test("a subagent's growth cut back under the limit before the turn ends is not told", async ($, on) => {
+  const w = world(on)
+  await $.session.start(start)
+  await $.turn.start({ text: '進めて', turnId: 't1' })
+  await $.tool.call(edit(AGENTS, lines(130), { agentId: 'a1' }))
+  await $.tool.call(edit(AGENTS, lines(90), { agentId: 'a1' }))
+  await $.turn.complete(done('t1'))
+  expect(w.toasts).toEqual([])
+})
+
+test("a subagent's growth is told at the length the turn ends with, once, a shell rewrite included", async ($, on) => {
+  const w = world(on)
+  w.write(AGENTS, lines(50))
+  await $.session.start(start)
+  await $.turn.start({ text: '進めて', turnId: 't1' })
+  // Cut by the subagent but still over: the latest length is told.
+  await $.tool.call(edit(AGENTS, lines(130), { agentId: 'a1' }))
+  await $.tool.call(edit(AGENTS, lines(120), { agentId: 'a1' }))
+  await $.turn.complete(done('t1'))
+  expect(w.toasts).toHaveLength(1)
+  expect(w.toasts[0]).toMatch(/（120行/)
+
+  // Grown by a subagent, then by a script: one toast, at the script's length.
+  await $.turn.start({ text: '続けて', turnId: 't2' })
+  await $.tool.call(edit(AGENTS, lines(130), { agentId: 'a1' }))
+  w.write(AGENTS, lines(140))
+  await $.turn.complete(done('t2'))
+  expect(w.toasts).toHaveLength(2)
+  expect(w.toasts[1]).toMatch(/（140行/)
+})
+
+test('after a /clear (a new session id, no session.start) the first turn tells what stands again', async ($, on) => {
+  const w = world(on)
+  w.write(AGENTS, lines(120))
+  w.write(CLAUDE, '@AGENTS.md\n# メモ\n')
+  await $.session.start(start)
+  expect(w.toasts).toHaveLength(2)
+
+  // The same conversation: a new turn says nothing.
+  await $.turn.start({ text: 'a', turnId: 't1' })
+  await $.turn.complete(done('t1'))
+  expect(w.toasts).toHaveLength(2)
+
+  w.sessionId = 's2'
+  await $.turn.start({ text: 'b', turnId: 't2' })
+  expect(w.toasts).toHaveLength(4)
+  expect(w.toasts[2]).toMatch(/^AGENTS\.md が目安を超えています（120行/)
+  // Told at the turn's start, not again at its end; a subagent's turn never starts over.
+  await $.turn.complete(done('t2'))
+  w.sessionId = 's3'
+  await $.turn.start({ text: 'sub', turnId: 'u1', agentId: 'a1' })
+  expect(w.toasts).toHaveLength(4)
 })

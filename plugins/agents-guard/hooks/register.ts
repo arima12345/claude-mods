@@ -20,12 +20,14 @@ import {
 const SAID = { plugin: 'agents-guard', key: 'said' } as const
 const MTIMES = { plugin: 'agents-guard', key: 'mtimes' } as const
 const PENDING = { plugin: 'agents-guard', key: 'pending' } as const
+const STARTED = { plugin: 'agents-guard', key: 'startedFor' } as const
 const EDITS = new Set(['Edit', 'Write', 'MultiEdit'])
 const TOAST_MS = 12_000
 
 type Settings = Limits & { isClaudeMdChecked: boolean }
-// Why a file is looked at: the session's start says what stands; later looks speak only of growth.
-type Why = 'start' | 'edit' | 'turn'
+// Why a file is looked at: the session's start says what stands; later looks speak only of growth,
+// but a subagent's growth, already told to the subagent, is told to the person at the turn's end as it now stands.
+type Why = 'start' | 'edit' | 'turn' | 'pending'
 
 function settingsOf(options: Record<string, unknown>): Settings {
   const positive = (v: unknown, fallback: number) => (typeof v === 'number' && v > 0 ? v : fallback)
@@ -74,8 +76,8 @@ async function look($: EngineInterface, s: Settings, path: string, root: string,
 
     return undefined
   }
-  if (why !== 'start' && !hasGrown(size, said)) return undefined
-  if (why === 'start' && said && !hasGrown(size, said)) return undefined
+  const isQuiet = why === 'pending' ? false : why === 'start' ? said !== undefined && !hasGrown(size, said) : !hasGrown(size, said)
+  if (isQuiet) return undefined
   await setSaid($, key, size)
   if (isClaudeMd) return { toast: CLAUDE_MD_TOAST, context: CLAUDE_MD_CONTEXT }
   const label = fileLabel(path, root)
@@ -95,18 +97,42 @@ function isWatched(path: string, root: string, s: Settings): boolean {
 
 const rootOf = ($: EngineInterface) => $.session.root().then(r => r.replace(/\\/g, '/').replace(/\/+$/, ''))
 
+// A conversation's start: the root files as they stand, told once, and the session it was told for.
+async function startCheck($: EngineInterface, s: Settings, sessionId: string | undefined): Promise<void> {
+  if (sessionId !== undefined) await $.state.set(STARTED, sessionId).catch(() => {})
+  const root = await rootOf($).catch(() => undefined)
+  if (root === undefined) return
+  for (const path of rootFiles(root, s)) {
+    const found = await look($, s, path, root, 'start').catch(() => undefined)
+    if (found) $.ui.toast(found.toast, { timeoutMs: TOAST_MS })
+    await noteMtime($, path)
+  }
+}
+
 export const register: Register = (on, options) => {
   const s = settingsOf(options)
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    const root = await rootOf($).catch(() => undefined)
-    if (root === undefined) return started
-    for (const path of rootFiles(root, s)) {
-      const found = await look($, s, path, root, 'start').catch(() => undefined)
-      if (found) $.ui.toast(found.toast, { timeoutMs: TOAST_MS })
-      await noteMtime($, path)
-    }
+    await startCheck($, s, await $.session.id().catch(() => undefined))
+
+    return started
+  })
+
+  // A /clear or a resume goes on under a new session id with no session.start: the first main turn starts over.
+  on('turn.start', async ($, e, next) => {
+    const started = await next(e)
+    if (e.agentId) return started
+    const id = await $.session.id().catch(() => undefined)
+    const seen = await $.state.get(STARTED).then(
+      r => r.value,
+      () => undefined,
+    )
+    if (id === undefined || id === seen) return started
+    await $.state.set(SAID, {}).catch(() => {})
+    await $.state.set(MTIMES, {}).catch(() => {})
+    await $.state.set(PENDING, {}).catch(() => {})
+    await startCheck($, s, id)
 
     return started
   })
@@ -122,7 +148,7 @@ export const register: Register = (on, options) => {
     await noteMtime($, path)
     if (!found) return done
     // A subagent's edit is told to the subagent; the person hears of it at the main turn's end.
-    if (e.agentId) await setPending($, pathKey(path), found.toast)
+    if (e.agentId) await setPending($, pathKey(path), path)
     else {
       await setPending($, pathKey(path), undefined)
       $.ui.toast(found.toast, { timeoutMs: TOAST_MS })
@@ -135,11 +161,16 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (e.agentId) return done
-    const pending = await readPending($)
-    if (Object.keys(pending).length > 0) await $.state.set(PENDING, {}).catch(() => {})
-    for (const toast of Object.values(pending)) $.ui.toast(toast, { timeoutMs: TOAST_MS })
     const root = await rootOf($).catch(() => undefined)
     if (root === undefined) return done
+    // Files a subagent grew are measured again: a later cut or rewrite decides what is told, once per file.
+    const pending = await readPending($)
+    if (Object.keys(pending).length > 0) await $.state.set(PENDING, {}).catch(() => {})
+    for (const path of Object.values(pending)) {
+      const found = await look($, s, path, root, 'pending').catch(() => undefined)
+      if (found) $.ui.toast(found.toast, { timeoutMs: TOAST_MS })
+      await noteMtime($, path)
+    }
     for (const path of rootFiles(root, s)) {
       if (!(await hasChanged($, path))) continue
       const found = await look($, s, path, root, 'turn').catch(() => undefined)
@@ -157,12 +188,12 @@ async function readPending($: EngineInterface): Promise<Record<string, string>> 
   )
 }
 
-// A subagent's latest word per file waits for the main turn's end; the main loop's own toast replaces it.
-async function setPending($: EngineInterface, key: string, toast: string | undefined): Promise<void> {
+// A file a subagent grew waits for the main turn's end; the main loop's own toast on it stands in for that.
+async function setPending($: EngineInterface, key: string, path: string | undefined): Promise<void> {
   const pending = { ...(await readPending($)) }
-  if (toast === undefined && !(key in pending)) return
-  if (toast === undefined) delete pending[key]
-  else pending[key] = toast
+  if (path === undefined && !(key in pending)) return
+  if (path === undefined) delete pending[key]
+  else pending[key] = path
   await $.state.set(PENDING, pending).catch(() => {})
 }
 

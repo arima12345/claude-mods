@@ -8,8 +8,10 @@ declare module 'claude-code' {
       said: Record<string, Size>
       // Per file, the modification time last seen, to look again only after a change.
       mtimes: Record<string, number>
-      // Per file, the toast a subagent's edit left for the person, shown at the main turn's end.
+      // Per file, the path of one a subagent grew, measured again and told at the main turn's end.
       pending: Record<string, string>
+      // The session id the start's look was made for: a /clear or a resume brings another.
+      startedFor: string
     }
   }
 }
