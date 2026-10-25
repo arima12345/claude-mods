@@ -6,5 +6,6 @@
     { "name": "edit-check", "source": "./plugins/edit-check" },
     { "name": "compact-memo", "source": "./plugins/compact-memo" },
     { "name": "ja-reply", "source": "./plugins/ja-reply" },
-    { "name": "phone-notify", "source": "./plugins/phone-notify" }]
+    { "name": "phone-notify", "source": "./plugins/phone-notify" },
+    { "name": "agents-guard", "source": "./plugins/agents-guard" }]
 }

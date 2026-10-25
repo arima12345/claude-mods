@@ -1,0 +1,12 @@
+{
+  "name": "agents-guard",
+  "version": "0.1.0",
+  "description": "AGENTS.md が目安（100行・6,000字）を超えたときと、ルートの CLAUDE.md に @AGENTS.md 以外の中身があるときに、ユーザーと Claude に知らせる",
+  "author": { "name": "arima12345" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "maxLines": { "type": "number", "title": "AGENTS.md の行数の目安", "description": "これを超えたら知らせる", "default": 100 },
+    "maxChars": { "type": "number", "title": "AGENTS.md の文字数の目安", "description": "これを超えたら知らせる（改行も1文字と数える）", "default": 6000 },
+    "checkClaudeMd": { "type": "boolean", "title": "ルートの CLAUDE.md の中身を見る", "description": "@AGENTS.md の1行のほかに中身があれば知らせる", "default": true }
+  }
+}
